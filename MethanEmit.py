@@ -1,336 +1,787 @@
-"""
-EMIT Methane Plume Detection App (Carbon Mapper Algorithm)
-----------------------------------------------------------
-This Streamlit application detects methane plumes using NASA's EMIT
-hyperspectral data. It implements the Column-wise Matched Filter (CMF)
-algorithm, which is the core of the Carbon Mapper operational workflow.
+"""EMIT Methane Plume Detection App.
 
-Author: (Your Name)
-Date: 2026
+Carbon Mapper-style methane detection on NASA EMIT hyperspectral data.
+UI/design preserved from the Sentinel-2 app.
 """
+from __future__ import annotations
 
-import streamlit as st
+import io
+import os
+import json
+import math
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
 import folium
-from streamlit_folium import st_folium
-import earthaccess
-import xarray as xr
 import numpy as np
 import pandas as pd
 import rasterio
-from rasterio.plot import show
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-import io
-import os
-from datetime import datetime, timedelta
-import tempfile
-from pathlib import Path
+import streamlit as st
+from folium.plugins import Draw
+from shapely.geometry import box, mapping, shape
+from shapely.ops import unary_union
+from streamlit_folium import st_folium
+
+try:
+    import earthaccess
+    EARTHACCESS_AVAILABLE = True
+except ImportError:
+    EARTHACCESS_AVAILABLE = False
+
 
 # ══════════════════════════════════════════════════════════════════════
-#  CONFIGURATION
+#  CONFIG
 # ══════════════════════════════════════════════════════════════════════
 
-# Target area: Aradkouh / Kahrizak landfill (Tehran)
-DEFAULT_AOI = {
-    "type": "Polygon",
-    "coordinates": [[
-        [51.20, 35.40],
-        [51.45, 35.40],
-        [51.45, 35.60],
-        [51.20, 35.60],
-        [51.20, 35.40]
-    ]]
+RESOLUTION = 60  # EMIT native pixel size (m)
+
+DEFAULT_AOI = box(51.20, 35.40, 51.45, 35.60)
+
+EMIT_ENH_COLLECTION = "EMITL2BCH4ENH"   # Methane Enhancement (ppm·m)
+EMIT_PLM_COLLECTION = "EMITL2BCH4PLM"   # Plume Complexes
+
+PARAMS = {
+    "plume_threshold_ppm_m": 1000.0,  # minimum enhancement
+    "min_plume_pixels": 10,
+    "wind_speed_m_s": 2.0,
+    "max_plume_area_km2": 100.0,
 }
 
-# EMIT data parameters
-EMIT_COLLECTION = "EMITL2BCH4ENH"  # Methane Enhancement product
-EMIT_PLM_COLLECTION = "EMITL2BCH4PLM"  # Plume Complexes product
+# Conversion constants
+PPB_TO_KG_M2 = 5.72e-6
+ALPHA_IME = 0.33
+BETA_IME = 0.45
+CH4_DENSITY_KG_M3 = 0.717
 
-# Algorithm parameters
-CMF_WINDOW_SIZE = 50       # Number of columns for covariance estimation
-CMF_MIN_WAVELENGTH = 2100  # nm, start of methane absorption window
-CMF_MAX_WAVELENGTH = 2450  # nm, end of methane absorption window
-PLUME_THRESHOLD = 1000     # ppm-m, minimum enhancement to be considered plume
-MIN_PLUME_PIXELS = 10      # Minimum pixels for a valid plume
 
 # ══════════════════════════════════════════════════════════════════════
-#  HELPER FUNCTIONS (Matched Filter Core)
+#  GEOMETRY HELPERS
 # ══════════════════════════════════════════════════════════════════════
 
-def load_emit_data(item, bbox):
-    """
-    Loads EMIT L2B CH4 enhancement data for a given STAC item.
-    Returns a numpy array of enhancement values (ppm-m).
-    """
-    # Open the COG (Cloud Optimized GeoTIFF) file
-    url = item.assets["EMITL2BCH4ENH"].href
-    with rasterio.open(url) as src:
-        # Read the data within the bounding box
-        window = rasterio.windows.from_bounds(
-            bbox[0], bbox[1], bbox[2], bbox[3], src.transform
+def normalize_geometry(obj):
+    if obj is None:
+        return None
+    if hasattr(obj, "__geo_interface__"):
+        obj = obj.__geo_interface__
+    if not isinstance(obj, dict):
+        return None
+    if obj.get("type") == "Feature":
+        return normalize_geometry(obj.get("geometry"))
+    if obj.get("type") == "FeatureCollection":
+        geoms = []
+        for feature in obj.get("features", []):
+            g = normalize_geometry(feature.get("geometry"))
+            if g:
+                geoms.append(shape(g))
+        return mapping(unary_union(geoms)) if geoms else None
+    try:
+        g = shape(obj)
+        return mapping(g) if not g.is_empty else None
+    except Exception:
+        return None
+
+
+def ensure_aoi(obj):
+    return normalize_geometry(obj) or mapping(DEFAULT_AOI)
+
+
+def aoi_bounds(aoi):
+    return shape(ensure_aoi(aoi)).bounds
+
+
+def create_map(aoi):
+    geometry = shape(ensure_aoi(aoi))
+    centroid = geometry.centroid
+    fmap = folium.Map(
+        [centroid.y, centroid.x],
+        zoom_start=11,
+        tiles="OpenStreetMap",
+    )
+    folium.GeoJson(
+        mapping(geometry),
+        style_function=lambda _: {"color": "blue", "fill": False, "weight": 2},
+    ).add_to(fmap)
+    Draw(
+        export=True,
+        draw_options={
+            "polyline": False,
+            "circle": False,
+            "marker": False,
+            "circlemarker": False,
+            "polygon": {
+                "allowIntersection": False,
+                "showArea": True,
+            },
+        },
+        edit_options={"edit": True, "remove": True},
+    ).add_to(fmap)
+    return fmap
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  EARTHDATA AUTH
+# ══════════════════════════════════════════════════════════════════════
+
+def login_earthdata():
+    """Authenticate with NASA Earthdata using Streamlit secrets."""
+    if not EARTHACCESS_AVAILABLE:
+        raise RuntimeError(
+            "Package 'earthaccess' is not installed. "
+            "Please check requirements.txt."
         )
-        data = src.read(1, window=window)
-        transform = src.window_transform(window)
-        crs = src.crs
-    return data, transform, crs
+    try:
+        username = st.secrets["EARTHDATA_USERNAME"]
+        password = st.secrets["EARTHDATA_PASSWORD"]
+    except (KeyError, FileNotFoundError):
+        raise RuntimeError(
+            "Earthdata credentials are not configured. "
+            "Add EARTHDATA_USERNAME and EARTHDATA_PASSWORD to Streamlit secrets."
+        )
 
-def column_wise_matched_filter(data, window_size=CMF_WINDOW_SIZE):
-    """
-    Implements the Column-wise Matched Filter (CMF) algorithm.
-    
-    This is a simplified version of the algorithm described in:
-    Thompson et al. (2015, 2016) and used by Carbon Mapper.
-    
-    The CMF estimates the background covariance from a moving window
-    of columns and applies a matched filter to enhance the methane signal.
-    """
-    n_rows, n_cols = data.shape
-    filtered = np.zeros_like(data)
-    
-    # Define the target absorption spectrum (simplified as a spectral shape)
-    # In a real implementation, this would be a high-resolution spectrum
-    target_spectrum = np.exp(-0.5 * ((np.arange(n_rows) - n_rows/2) / (n_rows/10))**2)
-    
-    for start_col in range(0, n_cols, window_size):
-        end_col = min(start_col + window_size, n_cols)
-        window = data[:, start_col:end_col]
-        
-        # Estimate background statistics (mean and covariance)
-        if window.shape[1] > 10:  # Ensure enough samples
-            background_mean = np.nanmean(window, axis=1, keepdims=True)
-            background_std = np.nanstd(window, axis=1, keepdims=True)
-            background_std[background_std == 0] = 1.0  # Avoid division by zero
-            
-            # Apply matched filter: (x - mu) / sigma * target_spectrum
-            normalized = (window - background_mean) / background_std
-            filtered[:, start_col:end_col] = normalized * target_spectrum[:, np.newaxis]
-        else:
-            filtered[:, start_col:end_col] = window
-            
-    return filtered
+    os.environ["EARTHDATA_USERNAME"] = username
+    os.environ["EARTHDATA_PASSWORD"] = password
 
-def estimate_flux_ime(plume_mask, enhancement_map, wind_speed=2.0):
+    try:
+        auth = earthaccess.login(strategy="environment")
+    except Exception as e:
+        raise RuntimeError(f"Earthdata login failed: {e}")
+
+    if not auth.authenticated:
+        raise RuntimeError(
+            "Earthdata did not accept the credentials. "
+            "Check your username/password or register at urs.earthdata.nasa.gov."
+        )
+    return auth
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  EMIT SEARCH & LOADING
+# ══════════════════════════════════════════════════════════════════════
+
+def search_emit_granules(aoi, start_date, end_date, max_cloud=None):
+    """Search NASA Earthdata for EMIT CH4 enhancement granules over the AOI."""
+    minx, miny, maxx, maxy = aoi_bounds(aoi)
+    results = earthaccess.search_data(
+        short_name=EMIT_ENH_COLLECTION,
+        bounding_box=(minx, miny, maxx, maxy),
+        temporal=(start_date.strftime("%Y-%m-%d"),
+                  end_date.strftime("%Y-%m-%d")),
+        count=200,
+    )
+    return list(results)
+
+
+def granule_datetime(granule) -> Optional[datetime]:
+    """Extract acquisition datetime from an earthaccess DataGranule."""
+    try:
+        umm = granule.get("umm", {}) if hasattr(granule, "get") else {}
+    except Exception:
+        umm = {}
+    temporal = umm.get("TemporalExtent", {}).get("RangeDateTime", {})
+    dt_str = temporal.get("BeginningDateTime")
+    if dt_str:
+        try:
+            return datetime.fromisoformat(dt_str.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            pass
+    # Fallback: parse from granule id
+    try:
+        gid = granule.get("meta", {}).get("native-id", "")
+        for part in gid.split("_"):
+            if len(part) >= 15 and part[:8].isdigit():
+                return datetime.strptime(part[:15], "%Y%m%dT%H%M%S")
+    except Exception:
+        pass
+    return None
+
+
+def granule_cloud(granule) -> float:
+    """Try to extract cloud cover from the granule metadata."""
+    try:
+        umm = granule.get("umm", {})
+        for attr in umm.get("AdditionalAttributes", []):
+            if attr.get("Name") == "CloudCover":
+                vals = attr.get("Values", [])
+                if vals:
+                    return float(vals[0])
+    except Exception:
+        pass
+    return 0.0
+
+
+def load_emit_enhancement(granule, aoi):
+    """Load EMIT CH4 enhancement clipped to AOI.
+
+    Returns (array_ppm_m, transform, crs) or (None, None, None) on failure.
     """
-    Estimates methane emission flux using the Integrated Methane Enhancement (IME) method.
-    
-    Formula: Q = (IME * U_eff) / L
-    where:
-    - IME = sum(enhancement * pixel_area) in ppm-m * m^2
-    - U_eff = effective wind speed (m/s)
-    - L = characteristic length of the plume (m)
+    try:
+        files = earthaccess.open([granule])
+    except Exception as e:
+        raise RuntimeError(f"Failed to open granule stream: {e}")
+
+    if not files:
+        raise RuntimeError("No files returned by earthaccess.open().")
+
+    tif_path = None
+    for f in files:
+        name = getattr(f, "path", str(f))
+        if name.lower().endswith((".tif", ".tiff")):
+            tif_path = f
+            break
+    if tif_path is None:
+        tif_path = files[0]
+
+    minx, miny, maxx, maxy = aoi_bounds(aoi)
+
+    with rasterio.open(tif_path) as src:
+        # Compute window from AOI
+        try:
+            from rasterio.windows import from_bounds
+            window = from_bounds(minx, miny, maxx, maxy, src.transform)
+            window = window.round_offsets().round_lengths()
+            data = src.read(1, window=window)
+            transform = src.window_transform(window)
+            crs = src.crs
+        except Exception:
+            data = src.read(1)
+            transform = src.transform
+            crs = src.crs
+
+    return data.astype(np.float32), transform, crs
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ALGORITHM: Plume detection & IME flux estimation
+# ══════════════════════════════════════════════════════════════════════
+
+def detect_plume(enhancement, threshold_ppm_m, min_pixels):
+    """Threshold the enhancement map and keep only connected components
+    that are large enough."""
+    from scipy.ndimage import label as nd_label
+
+    finite = np.isfinite(enhancement)
+    candidate = finite & (enhancement > threshold_ppm_m)
+    plume = np.zeros_like(candidate, dtype=bool)
+
+    if not candidate.any():
+        return plume
+
+    structure = np.ones((3, 3), dtype=np.uint8)
+    labeled, n = nd_label(candidate, structure=structure)
+    if n == 0:
+        return plume
+
+    sizes = np.bincount(labeled.ravel(), minlength=n + 1)
+    sizes[0] = 0
+    keep = sizes >= min_pixels
+    keep[0] = False
+    if keep.any():
+        plume = keep[labeled]
+    return plume
+
+
+def estimate_flux_ime(enhancement, plume_mask, wind_speed_m_s):
+    """Integrated Methane Enhancement flux estimation.
+
+    IME [kg] = Σ(ΔX_CH4 × A_pixel) × ρ_CH4_conversion
+    Q [kg/s] = U_eff × IME / L
     """
-    # Conversion factor: 1 ppm-m over 1 m^2 = 1e-6 m^3 CH4 / m^2
-    # CH4 density at STP: 0.717 kg/m^3
-    # So, 1 ppm-m * 1 m^2 = 1e-6 m^3 * 0.717 kg/m^3 = 7.17e-7 kg
-    
-    pixel_area = 60 * 60  # EMIT pixel size is 60m
-    ime = np.nansum(enhancement_map[plume_mask]) * pixel_area  # ppm-m * m^2
-    ime_kg = ime * 7.17e-7  # Convert to kg
-    
-    # Characteristic length (sqrt of plume area)
-    plume_area = np.sum(plume_mask) * pixel_area  # m^2
-    length = np.sqrt(plume_area) if plume_area > 0 else 1.0
-    
-    # Effective wind speed (simplified)
-    u_eff = 0.33 * wind_speed + 0.45
-    
-    # Emission rate in kg/s
-    q_kg_s = (ime_kg * u_eff) / length if length > 0 else 0
-    
-    # Convert to kg/h
-    q_kg_h = q_kg_s * 3600
-    
+    if not plume_mask.any():
+        return {
+            "Q_kg_h": 0.0,
+            "Q_ton_h": 0.0,
+            "IME_ppm_m2": 0.0,
+            "IME_kg": 0.0,
+            "plume_area_m2": 0.0,
+            "length_m": 0.0,
+            "U_eff_m_s": 0.0,
+            "n_pixels": 0,
+            "max_enhancement": 0.0,
+        }
+
+    pixel_area = RESOLUTION * RESOLUTION  # m²
+    vals = np.where(plume_mask, np.nan_to_num(enhancement, nan=0.0), 0.0)
+    # Enhancement is ppm·m; multiply by pixel area (m²) → ppm·m·m²
+    IME_ppm_m2 = float(np.sum(vals) * pixel_area)
+    # Convert ppm·m·m² → kg CH4
+    #   1 ppm·m over 1 m² ≈ 1e-6 m³ CH4 / m² at STP
+    #   × 0.717 kg/m³
+    IME_kg = IME_ppm_m2 * 1e-6 * CH4_DENSITY_KG_M3
+
+    n_pix = int(plume_mask.sum())
+    A_plume = n_pix * pixel_area
+    L = float(np.sqrt(A_plume)) if A_plume > 0 else 1.0
+    U_eff = ALPHA_IME * wind_speed_m_s + BETA_IME
+
+    Q_kg_s = U_eff * IME_kg / L if L > 0 else 0.0
+    Q_kg_h = Q_kg_s * 3600.0
+
     return {
-        "IME_ppm_m2": ime,
-        "IME_kg": ime_kg,
-        "plume_area_m2": plume_area,
-        "length_m": length,
-        "U_eff_m_s": u_eff,
-        "Q_kg_h": q_kg_h,
-        "Q_ton_h": q_kg_h / 1000
+        "Q_kg_h": Q_kg_h,
+        "Q_ton_h": Q_kg_h / 1000.0,
+        "IME_ppm_m2": IME_ppm_m2,
+        "IME_kg": IME_kg,
+        "plume_area_m2": A_plume,
+        "length_m": L,
+        "U_eff_m_s": U_eff,
+        "n_pixels": n_pix,
+        "max_enhancement": float(np.nanmax(vals)) if vals.size else 0.0,
     }
 
-def generate_plume_map(enhancement_map, threshold=PLUME_THRESHOLD):
-    """Creates a binary mask of methane plumes based on a threshold."""
-    plume_mask = enhancement_map > threshold
-    return plume_mask
 
 # ══════════════════════════════════════════════════════════════════════
-#  STREAMLIT UI
+#  IMAGE RENDERING
+# ══════════════════════════════════════════════════════════════════════
+
+def enhancement_png(array, mask=None):
+    """Render enhancement with symmetric stretch; optionally overlay mask."""
+    from PIL import Image
+    import matplotlib.pyplot as plt
+
+    data = np.asarray(array, dtype=np.float32)
+    finite = np.isfinite(data)
+    rgb = np.full((*data.shape, 3), 255, dtype=np.uint8)
+    if finite.any():
+        values = data[finite]
+        low, high = np.percentile(values, [2, 98])
+        if high <= low:
+            low, high = float(values.min()), float(values.max())
+        if high > low:
+            norm = np.clip((np.nan_to_num(data, nan=low) - low) / (high - low), 0, 1)
+            rgb = (plt.get_cmap("turbo")(norm)[:, :, :3] * 255).astype(np.uint8)
+            rgb[~finite] = 255
+
+    if mask is not None and mask.any():
+        overlay = np.zeros((*data.shape, 4), dtype=np.uint8)
+        overlay[..., 0] = 220
+        overlay[..., 3] = np.where(mask, 180, 0).astype(np.uint8)
+        base = Image.fromarray(rgb).convert("RGBA")
+        over = Image.fromarray(overlay, mode="RGBA")
+        rgb = np.array(Image.alpha_composite(base, over).convert("RGB"))
+
+    buffer = io.BytesIO()
+    Image.fromarray(rgb).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def legend_html(kind):
+    if kind == "plume":
+        rows = [
+            ("#e63946", "Detected plume"),
+            ("#ffffff", "Background"),
+        ]
+    elif kind == "enhancement":
+        rows = [
+            ("#d7191c", "High CH4 enhancement"),
+            ("#f7f7f7", "Near zero"),
+            ("#2c7bb6", "Low / negative"),
+        ]
+    else:
+        rows = [
+            ("#d7191c", "High"),
+            ("#ffffff", "No data"),
+        ]
+    items = "".join(
+        f'<div class="legend-row">'
+        f'<span class="legend-swatch" style="background:{c};"></span>'
+        f'<span>{t}</span></div>'
+        for c, t in rows
+    )
+    return (
+        f'<div class="result-legend">'
+        f'<div class="legend-heading">Legend</div>{items}</div>'
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  UI
 # ══════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="EMIT Methane Plume Detection",
+    page_title="EMIT Methane Detection",
     page_icon="🛰️",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="collapsed",
 )
 
-# --- Custom CSS (matching the previous app's style) ---
 st.markdown("""
 <style>
-    .stApp { background: #f1faee; }
-    .app-header { background: white; border: 1px solid #d8e6e8; border-radius: 16px; padding: 1rem; margin-bottom: 1rem; box-shadow: 0 2px 10px rgba(29,53,87,0.05); }
-    .app-title { font-size: 1.5rem; font-weight: 800; color: #1d3557; }
-    .app-subtitle { font-size: 0.8rem; color: #457b9d; }
-    .section-label { background: #a8dadc; color: #1d3557; border-radius: 999px; padding: 0.2rem 0.6rem; font-size: 0.7rem; font-weight: 800; display: inline-block; margin-bottom: 0.5rem; }
-    .result-card { background: white; border: 1px solid #d8e6e8; border-radius: 12px; padding: 1rem; height: 100%; }
-    .metric-value { font-size: 1.8rem; font-weight: 800; color: #1d3557; }
-    .metric-label { font-size: 0.75rem; color: #457b9d; font-weight: 600; }
+:root {
+    --red: #e63946;
+    --honeydew: #f1faee;
+    --frost: #a8dadc;
+    --blue: #457b9d;
+    --navy: #1d3557;
+    --black: #111111;
+    --white: #ffffff;
+    --border: #d8e6e8;
+    --muted: #4f5d63;
+    --dark-field: #292a33;
+}
+.stApp { background: #f1faee; color: #111111 !important; }
+[data-testid="stHeader"] { background: #f1faee !important; height: 3.25rem !important; }
+[data-testid="stSidebar"] { display: none; }
+.block-container { max-width: 1700px; padding-top: 3.9rem !important; padding-bottom: 0.8rem; padding-left: 1.2rem; padding-right: 1.2rem; }
+.app-header { position: relative; z-index: 10; display: flex; align-items: center; justify-content: space-between; background: #ffffff; border: 1px solid var(--border); border-radius: 16px; padding: 0.75rem 1rem; margin-top: 0.15rem; margin-bottom: 0.9rem; box-shadow: 0 2px 10px rgba(29,53,87,0.05); }
+.app-title { color: #111111 !important; font-size: 1.45rem; font-weight: 850; line-height: 1.1; }
+.app-subtitle { color: #111111 !important; font-size: 0.78rem; margin-top: 0.15rem; }
+.status-pill { background: #f1faee; color: #111111 !important; border: 1px solid #a8dadc; border-radius: 999px; padding: 0.35rem 0.7rem; font-size: 0.72rem; font-weight: 750; white-space: nowrap; }
+.app-card { background: #ffffff; border: 1px solid var(--border); border-radius: 15px; padding: 0.75rem; box-shadow: 0 2px 10px rgba(29,53,87,0.04); height: 100%; color: #111111 !important; }
+.card-title { color: #111111 !important; font-size: 1rem; font-weight: 800; margin-bottom: 0.1rem; }
+.card-caption { color: #111111 !important; font-size: 0.73rem; margin-bottom: 0.45rem; }
+.section-label { display: inline-block; background: #a8dadc; color: #111111 !important; border-radius: 999px; padding: 0.2rem 0.55rem; font-size: 0.65rem; font-weight: 800; letter-spacing: 0.03em; margin-bottom: 0.35rem; }
+.stApp p, .stApp label, .stApp small, .stApp strong, .stApp em, .stApp li, .stApp td, .stApp th, .stApp [data-testid="stMarkdownContainer"], .stApp [data-testid="stMarkdownContainer"] p, .stApp [data-testid="stMarkdownContainer"] span, .stApp [data-testid="stMarkdownContainer"] li { color: #111111 !important; }
+div[data-testid="stDateInput"] div[data-baseweb="input"], div[data-testid="stDateInput"] div[data-baseweb="input"] > div, div[data-testid="stDateInput"] input, div[data-testid="stDateInput"] input[type="text"], .stDateInput div[data-baseweb="input"], .stDateInput div[data-baseweb="input"] > div, .stDateInput input, .stDateInput input[type="text"] { background-color: var(--dark-field) !important; color: #ffffff !important; -webkit-text-fill-color: #ffffff !important; caret-color: #ffffff !important; opacity: 1 !important; }
+div[data-testid="stDateInput"] input::-webkit-datetime-edit, div[data-testid="stDateInput"] input::-webkit-datetime-edit-text, div[data-testid="stDateInput"] input::-webkit-datetime-edit-month-field, div[data-testid="stDateInput"] input::-webkit-datetime-edit-day-field, div[data-testid="stDateInput"] input::-webkit-datetime-edit-year-field, div[data-testid="stDateInput"] input::-webkit-datetime-edit-fields-wrapper, .stDateInput input::-webkit-datetime-edit, .stDateInput input::-webkit-datetime-edit-text, .stDateInput input::-webkit-datetime-edit-month-field, .stDateInput input::-webkit-datetime-edit-day-field, .stDateInput input::-webkit-datetime-edit-year-field, .stDateInput input::-webkit-datetime-edit-fields-wrapper { color: #ffffff !important; -webkit-text-fill-color: #ffffff !important; opacity: 1 !important; }
+div[data-testid="stNumberInput"] input, .stNumberInput input { background-color: var(--dark-field) !important; color: #ffffff !important; -webkit-text-fill-color: #ffffff !important; caret-color: #ffffff !important; }
+input::placeholder, textarea::placeholder { color: #bfc3cc !important; opacity: 1 !important; }
+div[data-baseweb="select"] input, div[data-baseweb="select"] [role="combobox"], div[data-baseweb="select"] * { color: #111111 !important; }
+div[data-baseweb="popover"] [role="listbox"], div[data-baseweb="popover"] ul[role="listbox"], div[data-baseweb="popover"] [role="option"], div[data-baseweb="popover"] li[role="option"] { background: #111318 !important; }
+div[data-baseweb="popover"] [role="listbox"] *, div[data-baseweb="popover"] [role="option"] *, ul[role="listbox"] *, li[role="option"] * { color: #ffffff !important; -webkit-text-fill-color: #ffffff !important; }
+div[data-baseweb="popover"] [role="option"]:hover, div[data-baseweb="popover"] li[role="option"]:hover { background: #2b2e38 !important; }
+.stDateInput, .stSlider, .stNumberInput, .stSelectbox { margin-bottom: 0.15rem; }
+.stSlider > div { padding-top: 0.05rem; padding-bottom: 0.05rem; }
+.stSlider label, .stSlider [data-testid="stTickBar"] * { color: #111111 !important; }
+.stSlider [data-testid="stThumbValue"], .stSlider [data-testid="stThumbValue"] * { color: #ffffff !important; }
+[data-baseweb="calendar"] *, [data-baseweb="popover"] [data-baseweb="calendar"] *, [data-baseweb="calendar"] button { color: #ffffff !important; }
+input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:focus { -webkit-text-fill-color: #ffffff !important; caret-color: #ffffff !important; }
+.auth-card { background: #f8fbfb; border: 1px solid #d7e4e7; border-radius: 11px; padding: 0.65rem 0.75rem; margin-top: 0.45rem; }
+.auth-status { background: #e8f7ea; border: 1px solid #9ed2a4; color: #155724 !important; border-radius: 9px; padding: 0.45rem 0.6rem; font-size: 0.76rem; font-weight: 700; margin-bottom: 0.45rem; }
+.auth-help { color: #111111 !important; font-size: 0.72rem; line-height: 1.45; margin: 0.2rem 0 0.45rem 0; }
+.stButton > button, .stDownloadButton > button { border-radius: 9px; min-height: 2.15rem; font-weight: 750; font-size: 0.78rem; color: #111111 !important; }
+.stButton > button[kind="primary"] { background: #e63946; border-color: #e63946; color: #ffffff !important; }
+.stButton > button[kind="primary"] *, .stDownloadButton > button[kind="primary"] * { color: #ffffff !important; }
+.stButton > button[kind="primary"]:hover { background: #c92f3b; border-color: #c92f3b; color: #ffffff !important; }
+.stDownloadButton > button { background: #ffffff; color: #111111 !important; border: 1px solid #a8dadc; }
+.stDownloadButton > button:hover { background: #f1faee; border-color: #457b9d; color: #111111 !important; }
+div[data-testid="stDataFrame"] { border: 1px solid var(--border); }
+div[data-testid="stDataFrame"] * { color: #111111 !important; }
+.result-legend { background: #ffffff; border: 1px solid #d7e4e7; border-radius: 10px; padding: 0.75rem 0.7rem; min-height: 96px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: center; gap: 0.42rem; }
+.result-legend .legend-heading { color: #111111 !important; font-size: 0.88rem; font-weight: 800; }
+.result-legend .legend-row { display: flex; align-items: center; gap: 0.45rem; color: #111111 !important; font-size: 0.82rem; line-height: 1.25; }
+.legend-swatch { width: 18px; height: 14px; min-width: 18px; border: 1px solid #555; border-radius: 2px; display: inline-block; }
+footer { visibility: hidden; }
+.stMarkdown { margin-bottom: 0.1rem; }
+.element-container { margin-bottom: 0.15rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- Header ---
+# Header
 st.markdown("""
 <div class="app-header">
-    <div class="app-title">🛰️ EMIT Methane Plume Detection</div>
-    <div class="app-subtitle">Carbon Mapper-style Column-wise Matched Filter on NASA EMIT hyperspectral data</div>
+    <div>
+        <div class="app-title">🛰️ EMIT Methane Plume Detection</div>
+        <div class="app-subtitle">NASA EMIT hyperspectral &nbsp;|&nbsp; Carbon Mapper-style matched-filter enhancements</div>
+    </div>
+    <div class="status-pill">60 m native &nbsp;•&nbsp; HyperSpectral</div>
 </div>
 """, unsafe_allow_html=True)
 
-# --- Section 1: Study Area & Data Selection ---
-st.markdown('<div class="section-label">01 · STUDY AREA & DATA</div>', unsafe_allow_html=True)
+# Check earthaccess
+if not EARTHACCESS_AVAILABLE:
+    st.error(
+        "⚠️ The `earthaccess` package is not installed. "
+        "Add it to your `requirements.txt` and reboot the app."
+    )
+    st.stop()
 
-col1, col2 = st.columns([2, 1])
+# Session state
+if "aoi" not in st.session_state:
+    st.session_state.aoi = mapping(DEFAULT_AOI)
 
-with col1:
-    st.markdown("### Area of Interest")
-    # Display map
-    m = folium.Map(location=[35.505, 51.330], zoom_start=11)
-    folium.GeoJson(DEFAULT_AOI, style_function=lambda x: {'color': 'blue', 'fill': False}).add_to(m)
-    folium.Marker(
-        [35.505, 51.330],
-        popup="Aradkouh Landfill",
-        icon=folium.Icon(color='red', icon='info-sign')
-    ).add_to(m)
-    st_folium(m, height=400, width=800)
+# ══════════════════════════════════════════════════════════════════════
+#  01 · STUDY AREA  +  02 · SEARCH
+# ══════════════════════════════════════════════════════════════════════
 
-with col2:
-    st.markdown("### Data Parameters")
-    start_date = st.date_input("Start date", datetime.now() - timedelta(days=90))
-    end_date = st.date_input("End date", datetime.now())
-    max_cloud = st.slider("Max cloud cover (%)", 0, 100, 20)
-    
-    if st.button("🔎 Search EMIT Scenes", type="primary", use_container_width=True):
-        with st.spinner("Searching NASA Earthdata for EMIT scenes..."):
-            try:
-                # Authenticate with Earthdata (uses ~/.netrc)
-                auth = earthaccess.login(strategy="netrc")
-                
-                # Search for EMIT methane enhancement granules
-                results = earthaccess.search_data(
-                    short_name=EMIT_COLLECTION,
-                    bounding_box=(51.20, 35.40, 51.45, 35.60),
-                    temporal=(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")),
-                    count=50
+map_col, control_col = st.columns([1.65, 1.0], gap="small")
+
+with map_col:
+    st.markdown('<div class="app-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">01 · STUDY AREA</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-title">Area of Interest</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="card-caption">Draw the study area directly on the map '
+        'using the polygon tool. Use the trash icon to delete and redraw.</div>',
+        unsafe_allow_html=True,
+    )
+    map_data = st_folium(
+        create_map(st.session_state.aoi),
+        height=385,
+        width=1000,
+        key="aoi_map",
+    )
+    if map_data and map_data.get("all_drawings"):
+        new_aoi = normalize_geometry(
+            {"type": "FeatureCollection", "features": map_data["all_drawings"]}
+        )
+        if new_aoi and new_aoi != st.session_state.aoi:
+            st.session_state.aoi = new_aoi
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with control_col:
+    st.markdown('<div class="app-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">02 · SEARCH</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-title">EMIT Granule Search</div>', unsafe_allow_html=True)
+
+    default_end = datetime.now().date()
+    default_start = default_end - timedelta(days=180)  # EMIT revisits are sparse
+
+    d1, d2 = st.columns(2, gap="small")
+    with d1:
+        start_date = st.date_input("Start date", default_start, key="start_date")
+    with d2:
+        end_date = st.date_input("End date", default_end, key="end_date")
+
+    st.markdown(
+        '<div class="card-caption">EMIT covers ~75 km swaths, so visits to a '
+        'given AOI are irregular. A wider window improves the chance of finding data.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.button("🔎  Search EMIT granules", type="primary", use_container_width=True):
+        try:
+            with st.spinner("Authenticating with NASA Earthdata…"):
+                login_earthdata()
+
+            with st.spinner("Searching EMIT collection…"):
+                results = search_emit_granules(
+                    st.session_state.aoi, start_date, end_date
                 )
-                
-                if results:
-                    st.session_state.emit_results = results
-                    st.success(f"Found {len(results)} EMIT granules")
-                else:
-                    st.warning("No EMIT granules found for this area and time range.")
-            except Exception as e:
-                st.error(f"Search failed: {e}")
-                st.info("Make sure you have a valid NASA Earthdata account and .netrc file.")
 
-# --- Section 2: Process and Visualize ---
-if "emit_results" in st.session_state:
-    st.markdown('<div class="section-label">02 · PROCESSING & RESULTS</div>', unsafe_allow_html=True)
-    
-    results = st.session_state.emit_results
-    
-    # Create a simple selector
-    options = [f"{i+1}. {r['id'][:50]}..." for i, r in enumerate(results)]
-    selected_idx = st.selectbox("Select a granule to process", range(len(results)), format_func=lambda x: options[x])
-    
-    if st.button("🚀 Run Methane Detection", type="primary", use_container_width=True):
-        with st.spinner("Downloading and processing EMIT data (this may take a few minutes)..."):
+            st.session_state["emit_results"] = results
+            st.session_state.pop("selected_granule", None)
+
+            if results:
+                st.success(f"{len(results)} EMIT granule(s) found")
+            else:
+                st.warning(
+                    "No EMIT granules found for this AOI and time range. "
+                    "Try a wider date range."
+                )
+        except Exception as e:
+            st.session_state["emit_results"] = []
+            st.error(f"Search failed: {e}")
+
+    emit_results = st.session_state.get("emit_results", [])
+
+    if emit_results:
+        rows = []
+        for g in emit_results:
+            dt = granule_datetime(g)
+            rows.append({
+                "date": dt,
+                "cloud": granule_cloud(g),
+                "id": g.get("meta", {}).get("native-id", "unknown")[:40],
+            })
+        table = pd.DataFrame(rows).sort_values("date", na_position="last")
+        st.dataframe(
+            table,
+            use_container_width=True,
+            height=112,
+            hide_index=True,
+            column_config={
+                "date": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD HH:mm"),
+                "cloud": st.column_config.NumberColumn("Cloud %", format="%.1f"),
+            },
+        )
+
+        def format_granule(idx):
+            dt = granule_datetime(emit_results[idx])
+            dt_text = dt.strftime("%Y-%m-%d %H:%M") if dt else "unknown"
+            gid = emit_results[idx].get("meta", {}).get("native-id", "")
+            return f"{dt_text}  ·  {gid[:50]}"
+
+        selected_idx = st.selectbox(
+            "Granule",
+            list(range(len(emit_results))),
+            format_func=format_granule,
+            key="granule_select",
+        )
+        st.session_state["selected_granule"] = emit_results[selected_idx]
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════
+#  03 · DETECTION  +  04 · PROCESS
+# ══════════════════════════════════════════════════════════════════════
+
+st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
+
+settings_col, action_col = st.columns([1.65, 1.0], gap="small")
+
+with settings_col:
+    st.markdown('<div class="app-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">03 · DETECTION</div>', unsafe_allow_html=True)
+
+    p1, p2, p3 = st.columns(3, gap="small")
+    with p1:
+        PARAMS["plume_threshold_ppm_m"] = st.number_input(
+            "Enhancement threshold (ppm·m)",
+            min_value=100.0,
+            max_value=10000.0,
+            value=float(PARAMS["plume_threshold_ppm_m"]),
+            step=100.0,
+            key="plume_threshold",
+        )
+    with p2:
+        PARAMS["min_plume_pixels"] = st.number_input(
+            "Minimum plume pixels",
+            min_value=1,
+            max_value=500,
+            value=int(PARAMS["min_plume_pixels"]),
+            step=1,
+            key="min_plume_pixels",
+        )
+    with p3:
+        PARAMS["wind_speed_m_s"] = st.number_input(
+            "Wind speed (m/s)",
+            min_value=0.1,
+            max_value=20.0,
+            value=float(PARAMS["wind_speed_m_s"]),
+            step=0.1,
+            key="wind_speed",
+        )
+
+    estimated_area_m2 = int(PARAMS["min_plume_pixels"]) * RESOLUTION * RESOLUTION
+    st.markdown(
+        f'<div class="card-caption">'
+        f'Minimum plume area ≈ {estimated_area_m2:,} m² at {RESOLUTION} m resolution. '
+        f'Wind speed is used for IME flux estimation.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with action_col:
+    st.markdown('<div class="app-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">04 · PROCESS</div>', unsafe_allow_html=True)
+
+    selected_granule = st.session_state.get("selected_granule")
+    if selected_granule is not None:
+        dt = granule_datetime(selected_granule)
+        dt_text = dt.strftime("%Y-%m-%d %H:%M") if dt else "unknown date"
+        st.markdown(
+            f'<div class="card-title">Ready to detect</div>'
+            f'<div class="card-caption">Granule: {dt_text}</div>',
+            unsafe_allow_html=True,
+        )
+
+        run_detect = st.button(
+            "🚀  Run Methane Detection",
+            type="primary",
+            use_container_width=True,
+            key="run_detect",
+        )
+
+        if run_detect:
+            progress = st.progress(0, text="Authenticating…")
             try:
-                item = results[selected_idx]
-                
-                # Download the data to a temporary directory
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    files = earthaccess.download([item], local_path=tmpdir)
-                    
-                    # Find the COG file
-                    cog_file = None
-                    for f in files:
-                        if f.endswith('.tif') or f.endswith('.tiff'):
-                            cog_file = f
-                            break
-                    
-                    if cog_file is None:
-                        st.error("No GeoTIFF file found in the granule.")
-                        st.stop()
-                    
-                    # Load the data
-                    with rasterio.open(cog_file) as src:
-                        data = src.read(1)
-                        transform = src.transform
-                        crs = src.crs
-                        bounds = src.bounds
-                    
-                    # Apply Column-wise Matched Filter
-                    filtered_data = column_wise_matched_filter(data)
-                    
-                    # Generate plume mask
-                    plume_mask = generate_plume_map(filtered_data)
-                    
-                    # Estimate flux
-                    flux = estimate_flux_ime(plume_mask, filtered_data)
-                    
-                    # --- Display Results ---
-                    st.markdown("### Results")
-                    
-                    # Metrics row
-                    m1, m2, m3, m4 = st.columns(4)
-                    with m1:
-                        st.markdown(f'<div class="result-card"><div class="metric-label">Estimated Flux</div><div class="metric-value">{flux["Q_kg_h"]:.1f} kg/h</div></div>', unsafe_allow_html=True)
-                    with m2:
-                        st.markdown(f'<div class="result-card"><div class="metric-label">Plume Area</div><div class="metric-value">{flux["plume_area_m2"]/1e6:.2f} km²</div></div>', unsafe_allow_html=True)
-                    with m3:
-                        st.markdown(f'<div class="result-card"><div class="metric-label">Max Enhancement</div><div class="metric-value">{np.nanmax(filtered_data):.0f} ppm-m</div></div>', unsafe_allow_html=True)
-                    with m4:
-                        st.markdown(f'<div class="result-card"><div class="metric-label">Plume Pixels</div><div class="metric-value">{np.sum(plume_mask):,}</div></div>', unsafe_allow_html=True)
-                    
-                    # Image display
-                    img_col1, img_col2 = st.columns(2)
-                    
-                    with img_col1:
-                        st.markdown("**Filtered Methane Enhancement (ppm-m)**")
-                        fig, ax = plt.subplots(figsize=(8, 6))
-                        vmin, vmax = np.nanpercentile(filtered_data, [2, 98])
-                        im = ax.imshow(filtered_data, cmap='RdBu_r', vmin=vmin, vmax=vmax)
-                        plt.colorbar(im, ax=ax, label='ppm-m')
-                        ax.set_title("Column-wise Matched Filter Output")
-                        st.pyplot(fig)
-                        plt.close(fig)
-                    
-                    with img_col2:
-                        st.markdown("**Detected Plume Mask**")
-                        fig, ax = plt.subplots(figsize=(8, 6))
-                        ax.imshow(plume_mask, cmap='Reds', alpha=0.8)
-                        ax.imshow(filtered_data, cmap='gray', alpha=0.3)
-                        ax.set_title(f"Plume Mask (threshold > {PLUME_THRESHOLD} ppm-m)")
-                        st.pyplot(fig)
-                        plt.close(fig)
-                    
-                    st.info(f"**Interpretation:** The algorithm detected {np.sum(plume_mask)} pixels with methane enhancement above {PLUME_THRESHOLD} ppm-m. Based on the IME method with an assumed wind speed of 2 m/s, the estimated emission rate is **{flux['Q_kg_h']:.1f} kg/h** ({flux['Q_ton_h']:.2f} t/h).")
-                    
-                    # Download button
-                    st.download_button(
-                        "⬇ Download Results (CSV)",
-                        pd.DataFrame([flux]).to_csv(index=False),
-                        file_name="emit_methane_flux.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-                    
-            except Exception as e:
-                st.error(f"Processing failed: {e}")
-                st.exception(e)
+                progress.progress(10, text="Logging in to Earthdata…")
+                login_earthdata()
 
-# --- Footer ---
-st.markdown("---")
-st.markdown("*Data source: NASA EMIT L2B Methane Enhancement (EMITL2BCH4ENH). Algorithm: Column-wise Matched Filter (Carbon Mapper operational workflow).*")
+                progress.progress(35, text="Loading EMIT enhancement…")
+                data, transform, crs = load_emit_enhancement(
+                    selected_granule, st.session_state.aoi
+                )
+
+                if data is None or data.size == 0:
+                    st.error("EMIT granule did not intersect the AOI.")
+                    st.stop()
+
+                progress.progress(65, text="Detecting plumes…")
+                plume_mask = detect_plume(
+                    data,
+                    PARAMS["plume_threshold_ppm_m"],
+                    int(PARAMS["min_plume_pixels"]),
+                )
+
+                progress.progress(85, text="Estimating flux…")
+                flux = estimate_flux_ime(
+                    data, plume_mask, PARAMS["wind_speed_m_s"]
+                )
+
+                st.session_state.emit_result = {
+                    "enhancement": data,
+                    "plume_mask": plume_mask,
+                    "flux": flux,
+                    "transform": transform,
+                    "crs": crs,
+                    "granule_dt": dt,
+                    "threshold": PARAMS["plume_threshold_ppm_m"],
+                    "wind_speed": PARAMS["wind_speed_m_s"],
+                }
+
+                progress.progress(100, text="Done")
+                st.success("Detection complete")
+            except Exception as e:
+                st.error(f"Detection failed: {e}")
+    else:
+        st.markdown(
+            '<div class="card-title">Select a granule first</div>'
+            '<div class="card-caption">Search EMIT granules, select one, then run the detection.</div>',
+            unsafe_allow_html=True,
+        )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  05 · RESULTS
+# ══════════════════════════════════════════════════════════════════════
+
+if "emit_result" in st.session_state:
+    result = st.session_state.emit_result
+    flux = result["flux"]
+    enhancement = result["enhancement"]
+    plume_mask = result["plume_mask"]
+
+    st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="app-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">05 · RESULTS</div>', unsafe_allow_html=True)
+
+    metrics = st.columns(6, gap="small")
+    metrics[0].metric("Flux (kg/h)", f"{flux['Q_kg_h']:.1f}")
+    metrics[1].metric("Flux (t/h)", f"{flux['Q_ton_h']:.2f}")
+    metrics[2].metric("Plume pixels", f"{flux['n_pixels']:,}")
+    metrics[3].metric("Plume area", f"{flux['plume_area_m2']/1e6:.3f} km²")
+    metrics[4].metric("Max enh. (ppm·m)", f"{flux['max_enhancement']:.0f}")
+    metrics[5].metric("Threshold (ppm·m)", f"{result['threshold']:.0f}")
+
+    img_col1, img_col2 = st.columns(2, gap="small")
+    with img_col1:
+        st.markdown('<div class="result-tag">Enhancement</div>', unsafe_allow_html=True)
+        st.markdown('<div class="result-name">CH4 Enhancement (ppm·m)</div>', unsafe_allow_html=True)
+        st.image(enhancement_png(enhancement), use_container_width=True, output_format="PNG")
+        st.markdown(legend_html("enhancement"), unsafe_allow_html=True)
+    with img_col2:
+        st.markdown('<div class="result-tag">Plume mask</div>', unsafe_allow_html=True)
+        st.markdown('<div class="result-name">Detected methane plume</div>', unsafe_allow_html=True)
+        st.image(
+            enhancement_png(enhancement, mask=plume_mask),
+            use_container_width=True,
+            output_format="PNG",
+        )
+        st.markdown(legend_html("plume"), unsafe_allow_html=True)
+
+    st.markdown(
+        f'<div class="result-note">'
+        f'<b>IME method:</b> IME = {flux["IME_ppm_m2"]:.2e} ppm·m·m² · '
+        f'converted to {flux["IME_kg"]:.2f} kg CH₄ · '
+        f'U_eff = {flux["U_eff_m_s"]:.2f} m/s · '
+        f'characteristic length L = {flux["length_m"]:.0f} m · '
+        f'Q = {flux["Q_kg_h"]:.1f} kg/h.'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    csv = pd.DataFrame([flux]).to_csv(index=False)
+    st.download_button(
+        "⬇ Download flux results (CSV)",
+        csv,
+        file_name="emit_flux.csv",
+        mime="text/csv",
+        key="download_flux_csv",
+        use_container_width=False,
+    )
+
+    st.markdown('</div>', unsafe_allow_html=True)
