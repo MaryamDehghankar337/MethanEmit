@@ -43,7 +43,7 @@ EMIT_ENH_COLLECTION = "EMITL2BCH4ENH"   # Methane Enhancement (ppm·m)
 EMIT_PLM_COLLECTION = "EMITL2BCH4PLM"   # Plume Complexes
 
 PARAMS = {
-    "plume_threshold_ppm_m": 1000.0,  # minimum enhancement
+    "plume_threshold_ppm_m": 1000.0,
     "min_plume_pixels": 10,
     "wind_speed_m_s": 2.0,
     "max_plume_area_km2": 100.0,
@@ -125,7 +125,6 @@ def create_map(aoi):
 # ══════════════════════════════════════════════════════════════════════
 
 def login_earthdata():
-    """Authenticate with NASA Earthdata using Streamlit secrets."""
     if not EARTHACCESS_AVAILABLE:
         raise RuntimeError(
             "Package 'earthaccess' is not installed. "
@@ -160,8 +159,7 @@ def login_earthdata():
 #  EMIT SEARCH & LOADING
 # ══════════════════════════════════════════════════════════════════════
 
-def search_emit_granules(aoi, start_date, end_date, max_cloud=None):
-    """Search NASA Earthdata for EMIT CH4 enhancement granules over the AOI."""
+def search_emit_granules(aoi, start_date, end_date):
     minx, miny, maxx, maxy = aoi_bounds(aoi)
     results = earthaccess.search_data(
         short_name=EMIT_ENH_COLLECTION,
@@ -174,7 +172,6 @@ def search_emit_granules(aoi, start_date, end_date, max_cloud=None):
 
 
 def granule_datetime(granule) -> Optional[datetime]:
-    """Extract acquisition datetime from an earthaccess DataGranule."""
     try:
         umm = granule.get("umm", {}) if hasattr(granule, "get") else {}
     except Exception:
@@ -186,7 +183,6 @@ def granule_datetime(granule) -> Optional[datetime]:
             return datetime.fromisoformat(dt_str.replace("Z", "+00:00")).replace(tzinfo=None)
         except ValueError:
             pass
-    # Fallback: parse from granule id
     try:
         gid = granule.get("meta", {}).get("native-id", "")
         for part in gid.split("_"):
@@ -198,7 +194,6 @@ def granule_datetime(granule) -> Optional[datetime]:
 
 
 def granule_cloud(granule) -> float:
-    """Try to extract cloud cover from the granule metadata."""
     try:
         umm = granule.get("umm", {})
         for attr in umm.get("AdditionalAttributes", []):
@@ -212,10 +207,6 @@ def granule_cloud(granule) -> float:
 
 
 def load_emit_enhancement(granule, aoi):
-    """Load EMIT CH4 enhancement clipped to AOI.
-
-    Returns (array_ppm_m, transform, crs) or (None, None, None) on failure.
-    """
     try:
         files = earthaccess.open([granule])
     except Exception as e:
@@ -236,7 +227,6 @@ def load_emit_enhancement(granule, aoi):
     minx, miny, maxx, maxy = aoi_bounds(aoi)
 
     with rasterio.open(tif_path) as src:
-        # Compute window from AOI
         try:
             from rasterio.windows import from_bounds
             window = from_bounds(minx, miny, maxx, maxy, src.transform)
@@ -253,12 +243,10 @@ def load_emit_enhancement(granule, aoi):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  ALGORITHM: Plume detection & IME flux estimation
+#  ALGORITHM
 # ══════════════════════════════════════════════════════════════════════
 
 def detect_plume(enhancement, threshold_ppm_m, min_pixels):
-    """Threshold the enhancement map and keep only connected components
-    that are large enough."""
     from scipy.ndimage import label as nd_label
 
     finite = np.isfinite(enhancement)
@@ -283,11 +271,6 @@ def detect_plume(enhancement, threshold_ppm_m, min_pixels):
 
 
 def estimate_flux_ime(enhancement, plume_mask, wind_speed_m_s):
-    """Integrated Methane Enhancement flux estimation.
-
-    IME [kg] = Σ(ΔX_CH4 × A_pixel) × ρ_CH4_conversion
-    Q [kg/s] = U_eff × IME / L
-    """
     if not plume_mask.any():
         return {
             "Q_kg_h": 0.0,
@@ -301,13 +284,9 @@ def estimate_flux_ime(enhancement, plume_mask, wind_speed_m_s):
             "max_enhancement": 0.0,
         }
 
-    pixel_area = RESOLUTION * RESOLUTION  # m²
+    pixel_area = RESOLUTION * RESOLUTION
     vals = np.where(plume_mask, np.nan_to_num(enhancement, nan=0.0), 0.0)
-    # Enhancement is ppm·m; multiply by pixel area (m²) → ppm·m·m²
     IME_ppm_m2 = float(np.sum(vals) * pixel_area)
-    # Convert ppm·m·m² → kg CH4
-    #   1 ppm·m over 1 m² ≈ 1e-6 m³ CH4 / m² at STP
-    #   × 0.717 kg/m³
     IME_kg = IME_ppm_m2 * 1e-6 * CH4_DENSITY_KG_M3
 
     n_pix = int(plume_mask.sum())
@@ -335,8 +314,8 @@ def estimate_flux_ime(enhancement, plume_mask, wind_speed_m_s):
 #  IMAGE RENDERING
 # ══════════════════════════════════════════════════════════════════════
 
-def enhancement_png(array, mask=None):
-    """Render enhancement with symmetric stretch; optionally overlay mask."""
+def enhancement_png(array, mask=None, colormap="turbo"):
+    """Render enhancement with a nicer colormap and optional plume overlay."""
     from PIL import Image
     import matplotlib.pyplot as plt
 
@@ -349,14 +328,19 @@ def enhancement_png(array, mask=None):
         if high <= low:
             low, high = float(values.min()), float(values.max())
         if high > low:
-            norm = np.clip((np.nan_to_num(data, nan=low) - low) / (high - low), 0, 1)
-            rgb = (plt.get_cmap("turbo")(norm)[:, :, :3] * 255).astype(np.uint8)
+            norm = np.clip(
+                (np.nan_to_num(data, nan=low) - low) / (high - low), 0, 1
+            )
+            cmap = plt.get_cmap(colormap)
+            rgb = (cmap(norm)[:, :, :3] * 255).astype(np.uint8)
             rgb[~finite] = 255
 
     if mask is not None and mask.any():
         overlay = np.zeros((*data.shape, 4), dtype=np.uint8)
-        overlay[..., 0] = 220
-        overlay[..., 3] = np.where(mask, 180, 0).astype(np.uint8)
+        overlay[..., 0] = 230
+        overlay[..., 1] = 40
+        overlay[..., 2] = 40
+        overlay[..., 3] = np.where(mask, 170, 0).astype(np.uint8)
         base = Image.fromarray(rgb).convert("RGBA")
         over = Image.fromarray(overlay, mode="RGBA")
         rgb = np.array(Image.alpha_composite(base, over).convert("RGB"))
@@ -462,6 +446,10 @@ div[data-testid="stDataFrame"] * { color: #111111 !important; }
 .result-legend .legend-heading { color: #111111 !important; font-size: 0.88rem; font-weight: 800; }
 .result-legend .legend-row { display: flex; align-items: center; gap: 0.45rem; color: #111111 !important; font-size: 0.82rem; line-height: 1.25; }
 .legend-swatch { width: 18px; height: 14px; min-width: 18px; border: 1px solid #555; border-radius: 2px; display: inline-block; }
+.result-card { background: #ffffff; border: 1px solid #d8e6e8; border-radius: 12px; padding: 0.6rem; }
+.result-tag { display: inline-block; background: #a8dadc; color: #111111 !important; border-radius: 999px; padding: 0.12rem 0.45rem; font-size: 0.6rem; font-weight: 800; letter-spacing: 0.03em; margin-bottom: 0.2rem; }
+.result-name { color: #111111 !important; font-size: 0.9rem; font-weight: 800; margin-bottom: 0.35rem; }
+.result-note { background: #f8fbfb; border: 1px solid #d7e4e7; border-radius: 10px; padding: 0.55rem 0.7rem; font-size: 0.8rem; color: #111111 !important; margin-top: 0.45rem; }
 footer { visibility: hidden; }
 .stMarkdown { margin-bottom: 0.1rem; }
 .element-container { margin-bottom: 0.15rem; }
@@ -479,7 +467,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Check earthaccess
 if not EARTHACCESS_AVAILABLE:
     st.error(
         "⚠️ The `earthaccess` package is not installed. "
@@ -487,9 +474,9 @@ if not EARTHACCESS_AVAILABLE:
     )
     st.stop()
 
-# Session state
 if "aoi" not in st.session_state:
     st.session_state.aoi = mapping(DEFAULT_AOI)
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  01 · STUDY AREA  +  02 · SEARCH
@@ -526,7 +513,7 @@ with control_col:
     st.markdown('<div class="card-title">EMIT Granule Search</div>', unsafe_allow_html=True)
 
     default_end = datetime.now().date()
-    default_start = default_end - timedelta(days=180)  # EMIT revisits are sparse
+    default_start = default_end - timedelta(days=365)
 
     d1, d2 = st.columns(2, gap="small")
     with d1:
@@ -552,6 +539,7 @@ with control_col:
 
             st.session_state["emit_results"] = results
             st.session_state.pop("selected_granule", None)
+            st.session_state.pop("emit_result", None)
 
             if results:
                 st.success(f"{len(results)} EMIT granule(s) found")
@@ -602,6 +590,7 @@ with control_col:
         st.session_state["selected_granule"] = emit_results[selected_idx]
 
     st.markdown('</div>', unsafe_allow_html=True)
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  03 · DETECTION  +  04 · PROCESS
@@ -734,6 +723,8 @@ if "emit_result" in st.session_state:
     flux = result["flux"]
     enhancement = result["enhancement"]
     plume_mask = result["plume_mask"]
+    transform = result.get("transform")
+    crs = result.get("crs")
 
     st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
@@ -747,41 +738,271 @@ if "emit_result" in st.session_state:
     metrics[4].metric("Max enh. (ppm·m)", f"{flux['max_enhancement']:.0f}")
     metrics[5].metric("Threshold (ppm·m)", f"{result['threshold']:.0f}")
 
-    img_col1, img_col2 = st.columns(2, gap="small")
-    with img_col1:
+    rc1, rc2 = st.columns(2, gap="small")
+    with rc1:
+        st.markdown('<div class="result-card">', unsafe_allow_html=True)
         st.markdown('<div class="result-tag">Enhancement</div>', unsafe_allow_html=True)
         st.markdown('<div class="result-name">CH4 Enhancement (ppm·m)</div>', unsafe_allow_html=True)
-        st.image(enhancement_png(enhancement), use_container_width=True, output_format="PNG")
-        st.markdown(legend_html("enhancement"), unsafe_allow_html=True)
-    with img_col2:
+        img_col, legend_col = st.columns([3.6, 1.0], gap="small")
+        with img_col:
+            st.image(
+                enhancement_png(enhancement, mask=None, colormap="turbo"),
+                use_container_width=True,
+                output_format="PNG",
+            )
+        with legend_col:
+            st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
+            st.markdown(legend_html("enhancement"), unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with rc2:
+        st.markdown('<div class="result-card">', unsafe_allow_html=True)
         st.markdown('<div class="result-tag">Plume mask</div>', unsafe_allow_html=True)
         st.markdown('<div class="result-name">Detected methane plume</div>', unsafe_allow_html=True)
-        st.image(
-            enhancement_png(enhancement, mask=plume_mask),
-            use_container_width=True,
-            output_format="PNG",
-        )
-        st.markdown(legend_html("plume"), unsafe_allow_html=True)
+        img_col, legend_col = st.columns([3.6, 1.0], gap="small")
+        with img_col:
+            st.image(
+                enhancement_png(enhancement, mask=plume_mask, colormap="turbo"),
+                use_container_width=True,
+                output_format="PNG",
+            )
+        with legend_col:
+            st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
+            st.markdown(legend_html("plume"), unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown(
         f'<div class="result-note">'
         f'<b>IME method:</b> IME = {flux["IME_ppm_m2"]:.2e} ppm·m·m² · '
-        f'converted to {flux["IME_kg"]:.2f} kg CH₄ · '
+        f'{flux["IME_kg"]:.2f} kg CH₄ · '
         f'U_eff = {flux["U_eff_m_s"]:.2f} m/s · '
-        f'characteristic length L = {flux["length_m"]:.0f} m · '
-        f'Q = {flux["Q_kg_h"]:.1f} kg/h.'
+        f'L = {flux["length_m"]:.0f} m · '
+        f'Q = {flux["Q_kg_h"]:.1f} kg/h'
         f'</div>',
         unsafe_allow_html=True,
     )
 
-    csv = pd.DataFrame([flux]).to_csv(index=False)
-    st.download_button(
-        "⬇ Download flux results (CSV)",
-        csv,
-        file_name="emit_flux.csv",
-        mime="text/csv",
-        key="download_flux_csv",
-        use_container_width=False,
+    st.markdown("#### 📥 Download results")
+    dl1, dl2, dl3, dl4 = st.columns(4, gap="small")
+
+    with dl1:
+        png_data = enhancement_png(enhancement, mask=None, colormap="turbo")
+        dt_str = result.get("granule_dt")
+        dt_tag = dt_str.strftime("%Y%m%d") if dt_str else "granule"
+        st.download_button(
+            "⬇ Enhancement PNG",
+            png_data,
+            file_name=f"enhancement_{dt_tag}.png",
+            mime="image/png",
+            use_container_width=True,
+            key="dl_enh_png",
+        )
+
+    with dl2:
+        png_mask = enhancement_png(enhancement, mask=plume_mask, colormap="turbo")
+        st.download_button(
+            "⬇ Plume mask PNG",
+            png_mask,
+            file_name=f"plume_{dt_tag}.png",
+            mime="image/png",
+            use_container_width=True,
+            key="dl_mask_png",
+        )
+
+    with dl3:
+        csv = pd.DataFrame([flux]).to_csv(index=False)
+        st.download_button(
+            "⬇ Flux CSV",
+            csv,
+            file_name=f"flux_{dt_tag}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_flux_csv",
+        )
+
+    with dl4:
+        try:
+            import zipfile
+            geo_pkg = io.BytesIO()
+            with zipfile.ZipFile(geo_pkg, "w", zipfile.ZIP_DEFLATED) as zf:
+                enh_tif = io.BytesIO()
+                with rasterio.open(
+                    enh_tif, "w", driver="GTiff",
+                    height=enhancement.shape[0], width=enhancement.shape[1],
+                    count=1, dtype="float32", crs=crs, transform=transform,
+                    nodata=np.nan, compress="deflate",
+                ) as dst:
+                    dst.write(enhancement.astype(np.float32), 1)
+                zf.writestr("enhancement_ppmm.tif", enh_tif.getvalue())
+
+                mask_tif = io.BytesIO()
+                with rasterio.open(
+                    mask_tif, "w", driver="GTiff",
+                    height=plume_mask.shape[0], width=plume_mask.shape[1],
+                    count=1, dtype="uint8", crs=crs, transform=transform,
+                    nodata=0, compress="deflate",
+                ) as dst:
+                    dst.write(plume_mask.astype(np.uint8), 1)
+                zf.writestr("plume_mask.tif", mask_tif.getvalue())
+
+            st.download_button(
+                "⬇ GeoTIFF bundle",
+                geo_pkg.getvalue(),
+                file_name=f"emit_{dt_tag}.zip",
+                mime="application/zip",
+                use_container_width=True,
+                key="dl_geo_zip",
+            )
+        except Exception:
+            st.button("⬇ GeoTIFF (unavailable)", disabled=True, use_container_width=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  06 · MULTI-DATE COMPARISON
+# ══════════════════════════════════════════════════════════════════════
+
+if "emit_results" in st.session_state and st.session_state.emit_results:
+    st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="app-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">06 · MULTI-DATE COMPARISON</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-title">Compare plumes over time</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="card-caption">'
+        'Processes all EMIT granules in the current search window and displays '
+        'them side by side. Useful for tracking emission evolution over months.'
+        '</div>',
+        unsafe_allow_html=True,
     )
+
+    btn_col1, btn_col2 = st.columns([1, 3], gap="small")
+    with btn_col1:
+        run_batch = st.button(
+            "🔁  Process all granules",
+            type="primary",
+            use_container_width=True,
+            key="run_batch",
+        )
+    with btn_col2:
+        max_granules = st.slider(
+            "Max granules to process",
+            min_value=2,
+            max_value=20,
+            value=6,
+            key="max_granules",
+        )
+
+    if run_batch:
+        granules = st.session_state.emit_results[: int(max_granules)]
+        progress = st.progress(0, text="Processing granules…")
+        batch_results = []
+        for i, g in enumerate(granules):
+            progress.progress(
+                int(100 * (i + 1) / len(granules)),
+                text=f"Processing {i+1}/{len(granules)}…",
+            )
+            try:
+                data, tform, tcrs = load_emit_enhancement(g, st.session_state.aoi)
+                if data is None or data.size == 0:
+                    continue
+                pm = detect_plume(
+                    data,
+                    PARAMS["plume_threshold_ppm_m"],
+                    int(PARAMS["min_plume_pixels"]),
+                )
+                f = estimate_flux_ime(data, pm, PARAMS["wind_speed_m_s"])
+                batch_results.append({
+                    "date": granule_datetime(g),
+                    "enhancement": data,
+                    "plume_mask": pm,
+                    "flux": f,
+                    "transform": tform,
+                    "crs": tcrs,
+                })
+            except Exception:
+                continue
+
+        st.session_state.batch_results = batch_results
+        progress.progress(100, text="Done")
+        st.success(f"Processed {len(batch_results)} granule(s)")
+
+    if "batch_results" in st.session_state and st.session_state.batch_results:
+        batch = st.session_state.batch_results
+
+        chart_rows = []
+        for r in batch:
+            if r["date"] is not None:
+                chart_rows.append({
+                    "date": r["date"],
+                    "flux_kg_h": r["flux"]["Q_kg_h"],
+                    "plume_pixels": r["flux"]["n_pixels"],
+                    "plume_area_km2": r["flux"]["plume_area_m2"] / 1e6,
+                })
+        if chart_rows:
+            chart_df = pd.DataFrame(chart_rows).sort_values("date").set_index("date")
+            st.markdown("##### Estimated flux over time")
+            st.line_chart(chart_df[["flux_kg_h"]], use_container_width=True, height=240)
+            st.dataframe(
+                chart_df,
+                use_container_width=True,
+                hide_index=False,
+                column_config={
+                    "flux_kg_h": st.column_config.NumberColumn("Flux (kg/h)", format="%.1f"),
+                    "plume_pixels": st.column_config.NumberColumn("Pixels", format="%d"),
+                    "plume_area_km2": st.column_config.NumberColumn("Area (km²)", format="%.3f"),
+                },
+            )
+            st.download_button(
+                "⬇ Download time series CSV",
+                chart_df.to_csv(),
+                file_name="emit_flux_timeseries.csv",
+                mime="text/csv",
+                key="dl_ts_csv",
+                use_container_width=False,
+            )
+
+        st.markdown("##### Visual comparison")
+        dates_labels = [
+            r["date"].strftime("%Y-%m-%d") if r["date"] else f"#{i+1}"
+            for i, r in enumerate(batch)
+        ]
+        selected_idx = st.select_slider(
+            "Select granule",
+            options=list(range(len(batch))),
+            format_func=lambda x: dates_labels[x],
+            value=0,
+            key="batch_slider",
+        )
+        chosen = batch[selected_idx]
+        cc1, cc2 = st.columns(2, gap="small")
+        with cc1:
+            st.markdown(
+                f'<div class="card-caption" style="font-weight:700;">'
+                f'{dates_labels[selected_idx]} · Enhancement'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            st.image(
+                enhancement_png(chosen["enhancement"], mask=None, colormap="turbo"),
+                use_container_width=True,
+                output_format="PNG",
+            )
+        with cc2:
+            st.markdown(
+                f'<div class="card-caption" style="font-weight:700;">'
+                f'{dates_labels[selected_idx]} · Plume mask'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            st.image(
+                enhancement_png(chosen["enhancement"], mask=chosen["plume_mask"], colormap="turbo"),
+                use_container_width=True,
+                output_format="PNG",
+            )
+        m1, m2, m3 = st.columns(3, gap="small")
+        m1.metric("Flux (kg/h)", f"{chosen['flux']['Q_kg_h']:.1f}")
+        m2.metric("Plume pixels", f"{chosen['flux']['n_pixels']:,}")
+        m3.metric("Plume area (km²)", f"{chosen['flux']['plume_area_m2']/1e6:.3f}")
 
     st.markdown('</div>', unsafe_allow_html=True)
