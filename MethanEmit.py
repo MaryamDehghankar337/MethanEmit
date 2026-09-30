@@ -50,7 +50,6 @@ PARAMS = {
     "max_plume_area_km2": 100.0,
 }
 
-# Conversion constants
 PPB_TO_KG_M2 = 5.72e-6
 ALPHA_IME = 0.33
 BETA_IME = 0.45
@@ -140,7 +139,7 @@ def create_map(aoi):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  GEOCODING (place name → AOI)
+#  GEOCODING
 # ══════════════════════════════════════════════════════════════════════
 
 def geocode_place(query: str):
@@ -306,7 +305,6 @@ def load_emit_enhancement(granule, aoi):
 
     data = data.astype(np.float32)
 
-    # ── Mask nodata / fill values so they don't pollute the calculation ──
     if nodata is not None:
         try:
             nd = float(nodata)
@@ -319,10 +317,8 @@ def load_emit_enhancement(granule, aoi):
         data = np.where(np.isclose(data, fv, rtol=0, atol=1e-3),
                         np.nan, data)
 
-    # Physically implausible magnitudes (EMIT enhancement is in ppm·m)
     data = np.where(np.abs(data) > 1e6, np.nan, data)
 
-    # Optionally clip to AOI polygon (removes edges outside drawn polygon)
     try:
         from rasterio.features import geometry_mask
         geom_mask = geometry_mask(
@@ -339,11 +335,29 @@ def load_emit_enhancement(granule, aoi):
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  COVERAGE HELPERS
+# ══════════════════════════════════════════════════════════════════════
+
+def valid_coverage(data):
+    if data is None or data.size == 0:
+        return 0.0
+    return float(np.isfinite(data).sum()) / float(data.size)
+
+
+def coverage_badge(data):
+    c = valid_coverage(data) * 100
+    if c < 5:
+        return f"⚠️ Very low coverage: {c:.1f}% of AOI", "#e63946"
+    if c < 20:
+        return f"⚠️ Partial coverage: {c:.1f}% of AOI", "#f4a261"
+    return f"✓ Good coverage: {c:.1f}% of AOI", "#2a9d8f"
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  ALGORITHM
 # ══════════════════════════════════════════════════════════════════════
 
 def detect_plume(enhancement, threshold_ppm_m, min_pixels):
-    """Detect plumes: threshold → denoise → keep components ≥ min_pixels."""
     from scipy.ndimage import (
         label as nd_label,
         binary_opening,
@@ -358,10 +372,7 @@ def detect_plume(enhancement, threshold_ppm_m, min_pixels):
         return plume
 
     structure = np.ones((3, 3), dtype=np.uint8)
-
-    # Remove single-pixel speckles (opening)
     candidate = binary_opening(candidate, structure=structure, iterations=1)
-    # Fill small holes inside plumes (closing)
     candidate = binary_closing(candidate, structure=structure, iterations=1)
 
     if not candidate.any():
@@ -381,32 +392,20 @@ def detect_plume(enhancement, threshold_ppm_m, min_pixels):
 
 
 def estimate_flux_ime(enhancement, plume_mask, wind_speed_m_s):
-    """IME-based flux estimation with proper handling of NaN pixels."""
+    empty = {
+        "Q_kg_h": 0.0, "Q_ton_h": 0.0,
+        "IME_ppm_m2": 0.0, "IME_kg": 0.0,
+        "plume_area_m2": 0.0, "length_m": 0.0,
+        "U_eff_m_s": 0.0, "n_pixels": 0,
+        "max_enhancement": 0.0, "mean_enhancement": 0.0,
+    }
     if plume_mask is None or not plume_mask.any():
-        return {
-            "Q_kg_h": 0.0,
-            "Q_ton_h": 0.0,
-            "IME_ppm_m2": 0.0,
-            "IME_kg": 0.0,
-            "plume_area_m2": 0.0,
-            "length_m": 0.0,
-            "U_eff_m_s": 0.0,
-            "n_pixels": 0,
-            "max_enhancement": 0.0,
-            "mean_enhancement": 0.0,
-        }
+        return empty
 
-    # Only sum over valid plume pixels
     valid_plume = plume_mask & np.isfinite(enhancement)
     n_pix = int(valid_plume.sum())
     if n_pix == 0:
-        return {
-            "Q_kg_h": 0.0, "Q_ton_h": 0.0,
-            "IME_ppm_m2": 0.0, "IME_kg": 0.0,
-            "plume_area_m2": 0.0, "length_m": 0.0,
-            "U_eff_m_s": 0.0, "n_pixels": 0,
-            "max_enhancement": 0.0, "mean_enhancement": 0.0,
-        }
+        return empty
 
     pixel_area = RESOLUTION * RESOLUTION
     vals = np.where(valid_plume, enhancement, 0.0)
@@ -441,7 +440,6 @@ def estimate_flux_ime(enhancement, plume_mask, wind_speed_m_s):
 # ══════════════════════════════════════════════════════════════════════
 
 def _compute_vrange(data):
-    """Robust percentile-based range for rendering & legends."""
     finite = np.isfinite(data)
     if not finite.any():
         return 0.0, 1.0
@@ -460,8 +458,10 @@ def enhancement_png(
     colormap="turbo",
     show_outline=True,
     outline_color=(255, 255, 0),
+    vmin=None,
+    vmax=None,
 ):
-    """Render enhancement with optional plume overlay + yellow outline."""
+    """Render enhancement with optional plume overlay + outline."""
     from PIL import Image
     import matplotlib.pyplot as plt
 
@@ -469,16 +469,17 @@ def enhancement_png(
     finite = np.isfinite(data)
     rgb = np.full((*data.shape, 3), 255, dtype=np.uint8)
 
-    vmin, vmax = _compute_vrange(data)
-    if finite.any():
+    if vmin is None or vmax is None:
+        vmin, vmax = _compute_vrange(data)
+
+    if finite.any() and vmax > vmin:
         norm = np.clip(
             (np.nan_to_num(data, nan=vmin) - vmin) / (vmax - vmin), 0, 1
         )
         cmap = plt.get_cmap(colormap)
         rgb = (cmap(norm)[:, :, :3] * 255).astype(np.uint8)
-        rgb[~finite] = 255  # white = no data
+        rgb[~finite] = 255
 
-    # Optional soft red overlay + yellow outline for plume pixels
     if mask is not None and mask.any():
         overlay = np.zeros((*data.shape, 4), dtype=np.uint8)
         overlay[..., 0] = 230
@@ -505,10 +506,12 @@ def enhancement_png(
 
 
 def colorbar_png(vmin, vmax, colormap="turbo", label="CH₄ enhancement (ppm·m)"):
-    """Generate a real colorbar PNG matching the enhancement rendering."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
+    if vmax <= vmin:
+        vmax = vmin + 1.0
 
     fig, ax = plt.subplots(figsize=(0.9, 3.2), dpi=100)
     norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
@@ -623,15 +626,13 @@ div[data-baseweb="popover"] [role="option"]:hover, div[data-baseweb="popover"] l
 [data-baseweb="calendar"] *, [data-baseweb="popover"] [data-baseweb="calendar"] *, [data-baseweb="calendar"] button { color: #ffffff !important; }
 input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:focus { -webkit-text-fill-color: #ffffff !important; caret-color: #ffffff !important; }
 
-/* ───── BUTTONS ───── */
+/* BUTTONS */
 .stButton > button, .stDownloadButton > button {
     border-radius: 9px;
     min-height: 2.15rem;
     font-weight: 750;
     font-size: 0.78rem;
 }
-
-/* Primary (red) */
 .stButton > button[kind="primary"],
 .stDownloadButton > button[kind="primary"] {
     background: #e63946 !important;
@@ -648,8 +649,6 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
     background: #c92f3b !important;
     border-color: #c92f3b !important;
 }
-
-/* Secondary (navy → white on hover) */
 .stButton > button[kind="secondary"],
 .stDownloadButton > button {
     background: #1d3557 !important;
@@ -672,11 +671,9 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
     color: #111111 !important;
     -webkit-text-fill-color: #111111 !important;
 }
-
 .stButton > button:disabled,
 .stDownloadButton > button:disabled { opacity: 0.55 !important; }
 
-/* Keep images inside their column */
 [data-testid="stImage"] {
     max-width: 100% !important;
     overflow: hidden;
@@ -708,7 +705,6 @@ footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
-# Header
 st.markdown("""
 <div class="app-header">
     <div>
@@ -1097,7 +1093,8 @@ if "emit_result" in st.session_state:
         with img_col:
             st.image(
                 enhancement_png(enhancement, mask=plume_mask,
-                                colormap="turbo", show_outline=True),
+                                colormap="turbo", show_outline=True,
+                                vmin=vmin_enh, vmax=vmax_enh),
                 use_container_width=True,
                 output_format="PNG",
             )
@@ -1127,7 +1124,8 @@ if "emit_result" in st.session_state:
             st.image(
                 enhancement_png(enhancement, mask=plume_mask,
                                 colormap="turbo", show_outline=True,
-                                outline_color=(255, 255, 0)),
+                                outline_color=(255, 255, 0),
+                                vmin=vmin_enh, vmax=vmax_enh),
                 use_container_width=True,
                 output_format="PNG",
             )
@@ -1163,7 +1161,8 @@ if "emit_result" in st.session_state:
 
     with dl1:
         png_data = enhancement_png(enhancement, mask=plume_mask,
-                                    colormap="turbo", show_outline=True)
+                                    colormap="turbo", show_outline=True,
+                                    vmin=vmin_enh, vmax=vmax_enh)
         st.download_button(
             "⬇ Enhancement PNG",
             png_data,
@@ -1175,7 +1174,8 @@ if "emit_result" in st.session_state:
 
     with dl2:
         png_mask = enhancement_png(enhancement, mask=plume_mask,
-                                    colormap="turbo", show_outline=True)
+                                    colormap="turbo", show_outline=True,
+                                    vmin=vmin_enh, vmax=vmax_enh)
         st.download_button(
             "⬇ Plume mask PNG",
             png_mask,
@@ -1282,6 +1282,8 @@ if "emit_results" in st.session_state and st.session_state.emit_results:
                 data, tform, tcrs = load_emit_enhancement(g, st.session_state.aoi)
                 if data is None or data.size == 0:
                     continue
+                if valid_coverage(data) < 0.02:
+                    continue
                 pm = detect_plume(
                     data,
                     PARAMS["plume_threshold_ppm_m"],
@@ -1343,45 +1345,84 @@ if "emit_results" in st.session_state and st.session_state.emit_results:
             r["date"].strftime("%Y-%m-%d") if r["date"] else f"#{i+1}"
             for i, r in enumerate(batch)
         ]
+        safe_labels = {i: dates_labels[i] for i in range(len(dates_labels))}
+        _batch_key = f"batch_slider_{len(batch)}"
         selected_idx = st.select_slider(
             "Select granule",
             options=list(range(len(batch))),
-            format_func=lambda x: dates_labels[x],
+            format_func=lambda x: safe_labels.get(x, f"#{x}"),
             value=0,
-            key="batch_slider",
+            key=_batch_key,
         )
         chosen = batch[selected_idx]
-        cvmin, cvmax = _compute_vrange(chosen["enhancement"])
+
+        # shared color range across all batch results
+        _all_vals = []
+        for r in batch:
+            e = r["enhancement"]
+            if np.isfinite(e).any():
+                _all_vals.append(e[np.isfinite(e)])
+        if _all_vals:
+            _all_vals = np.concatenate(_all_vals)
+            cvmin, cvmax = np.percentile(_all_vals, [2, 98])
+        else:
+            cvmin, cvmax = 0.0, 1.0
+        if cvmax <= cvmin:
+            cvmax = cvmin + 1.0
+
+        _has_plume = chosen["flux"]["n_pixels"] > 0
+        _cov_lbl, _cov_col = coverage_badge(chosen["enhancement"])
+
         cc1, cc2 = st.columns(2, gap="small")
         with cc1:
             st.markdown(
                 f'<div class="card-caption" style="font-weight:700;">'
                 f'{dates_labels[selected_idx]} · Enhancement'
-                f'</div>',
+                f'</div>'
+                f'<div class="card-caption" style="color:{_cov_col} !important;'
+                f'font-weight:700;">{_cov_lbl}</div>',
                 unsafe_allow_html=True,
             )
             st.image(
-                enhancement_png(chosen["enhancement"], mask=chosen["plume_mask"],
-                                colormap="turbo", show_outline=True),
+                enhancement_png(chosen["enhancement"],
+                                mask=chosen["plume_mask"],
+                                colormap="turbo",
+                                show_outline=_has_plume,
+                                vmin=cvmin, vmax=cvmax),
                 use_container_width=True,
                 output_format="PNG",
             )
             st.image(colorbar_png(cvmin, cvmax, "turbo"), width=90)
         with cc2:
+            if _has_plume:
+                status_html = (
+                    f'<div class="card-caption" style="color:#2a9d8f !important;'
+                    f'font-weight:700;">✓ Plume detected</div>'
+                )
+            else:
+                status_html = (
+                    f'<div class="card-caption" style="color:#e63946 !important;'
+                    f'font-weight:700;">✗ No plume above threshold '
+                    f'({PARAMS["plume_threshold_ppm_m"]:.0f} ppm·m)</div>'
+                )
             st.markdown(
                 f'<div class="card-caption" style="font-weight:700;">'
                 f'{dates_labels[selected_idx]} · Plume outline'
-                f'</div>',
+                f'</div>{status_html}',
                 unsafe_allow_html=True,
             )
             st.image(
-                enhancement_png(chosen["enhancement"], mask=chosen["plume_mask"],
-                                colormap="turbo", show_outline=True),
+                enhancement_png(chosen["enhancement"],
+                                mask=chosen["plume_mask"],
+                                colormap="turbo",
+                                show_outline=_has_plume,
+                                vmin=cvmin, vmax=cvmax),
                 use_container_width=True,
                 output_format="PNG",
             )
             st.markdown(
-                legend_html("plume", n_pixels=chosen["flux"]["n_pixels"],
+                legend_html("plume", cvmin, cvmax,
+                            n_pixels=chosen["flux"]["n_pixels"],
                             mean_enh=chosen["flux"]["mean_enhancement"]),
                 unsafe_allow_html=True,
             )
@@ -1394,7 +1435,7 @@ if "emit_results" in st.session_state and st.session_state.emit_results:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  07 · 30-DAY PLUME EVOLUTION
+#  07 · PLUME EVOLUTION WINDOW
 # ══════════════════════════════════════════════════════════════════════
 
 if "emit_result" in st.session_state:
@@ -1405,7 +1446,7 @@ if "emit_result" in st.session_state:
         st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
         st.markdown('<div class="app-card">', unsafe_allow_html=True)
         st.markdown(
-            '<div class="section-label">07 · 30-DAY PLUME EVOLUTION</div>',
+            '<div class="section-label">07 · PLUME EVOLUTION WINDOW</div>',
             unsafe_allow_html=True,
         )
         st.markdown(
@@ -1419,6 +1460,13 @@ if "emit_result" in st.session_state:
             f'appears, disappears, moves, and grows or shrinks across the window.'
             f'</div>',
             unsafe_allow_html=True,
+        )
+
+        st.info(
+            "💡 Methane plumes are transient. A source may appear on some "
+            "overpasses and not others due to intermittent emission, cloud cover, "
+            "or wind dispersion. Only some observations showing a plume is "
+            "normal and expected."
         )
 
         ec1, ec2 = st.columns([1, 1], gap="small")
@@ -1476,6 +1524,11 @@ if "emit_result" in st.session_state:
                             )
                             if data is None or data.size == 0:
                                 continue
+
+                            cov = valid_coverage(data)
+                            if cov < 0.02:
+                                continue
+
                             pm = detect_plume(
                                 data,
                                 PARAMS["plume_threshold_ppm_m"],
@@ -1510,6 +1563,7 @@ if "emit_result" in st.session_state:
                                 "crs": tcrs,
                                 "centroid_px": centroid_px,
                                 "centroid_geo": centroid_geo,
+                                "coverage": cov,
                             })
                         except Exception:
                             continue
@@ -1540,6 +1594,21 @@ if "emit_result" in st.session_state:
                 f'threshold of {PARAMS["plume_threshold_ppm_m"]:.0f} ppm·m.'
                 f'</div>',
                 unsafe_allow_html=True,
+            )
+
+            cov_rows = []
+            for r in evo:
+                lbl, col = coverage_badge(r["enhancement"])
+                cov_rows.append({
+                    "date": r["date"].strftime("%Y-%m-%d") if r["date"] else "-",
+                    "coverage": lbl,
+                    "flux_kg_h": r["flux"]["Q_kg_h"],
+                })
+            st.markdown("##### Data coverage per observation")
+            st.dataframe(
+                pd.DataFrame(cov_rows),
+                use_container_width=True,
+                hide_index=True,
             )
 
             rows = []
@@ -1610,45 +1679,93 @@ if "emit_result" in st.session_state:
                     },
                 )
 
+            # shared color range for evolution
+            all_valid = []
+            for r in evo:
+                e = r["enhancement"]
+                if np.isfinite(e).any():
+                    all_valid.append(e[np.isfinite(e)])
+            if all_valid:
+                all_valid = np.concatenate(all_valid)
+                shared_vmin, shared_vmax = np.percentile(all_valid, [2, 98])
+            else:
+                shared_vmin, shared_vmax = 0.0, 1.0
+            if shared_vmax <= shared_vmin:
+                shared_vmax = shared_vmin + 1.0
+
             st.markdown("##### Visual evolution")
             dates_labels = [
                 r["date"].strftime("%Y-%m-%d") if r["date"] else f"#{i+1}"
                 for i, r in enumerate(evo)
             ]
+            safe_labels = {i: dates_labels[i] for i in range(len(dates_labels))}
+            _evo_key = f"evo_slider_{len(evo)}"
             sel_idx = st.select_slider(
                 "Select observation",
                 options=list(range(len(evo))),
-                format_func=lambda x: dates_labels[x],
+                format_func=lambda x: safe_labels.get(x, f"#{x}"),
                 value=0,
-                key="evo_slider",
+                key=_evo_key,
             )
             chosen = evo[sel_idx]
-            cvmin, cvmax = _compute_vrange(chosen["enhancement"])
+            _cov_lbl, _cov_col = coverage_badge(chosen["enhancement"])
+            _has_plume = chosen["flux"]["n_pixels"] > 0
+
             cc1, cc2 = st.columns(2, gap="small")
             with cc1:
                 st.markdown(
                     f'<div class="card-caption" style="font-weight:700;">'
-                    f'{dates_labels[sel_idx]} · Enhancement + outline'
-                    f'</div>',
+                    f'{dates_labels[sel_idx]} · Enhancement'
+                    f'</div>'
+                    f'<div class="card-caption" style="color:{_cov_col} !important;'
+                    f'font-weight:700;">{_cov_lbl}</div>',
                     unsafe_allow_html=True,
                 )
                 st.image(
-                    enhancement_png(chosen["enhancement"],
-                                    mask=chosen["plume_mask"],
-                                    colormap="turbo", show_outline=True),
+                    enhancement_png(
+                        chosen["enhancement"],
+                        mask=chosen["plume_mask"],
+                        colormap="turbo",
+                        show_outline=_has_plume,
+                        vmin=shared_vmin,
+                        vmax=shared_vmax,
+                    ),
                     use_container_width=True,
                     output_format="PNG",
                 )
-                st.image(colorbar_png(cvmin, cvmax, "turbo"), width=90)
+                st.image(colorbar_png(shared_vmin, shared_vmax, "turbo"), width=90)
             with cc2:
+                if _has_plume:
+                    status_html = (
+                        f'<div class="card-caption" style="color:#2a9d8f !important;'
+                        f'font-weight:700;">✓ Plume detected</div>'
+                    )
+                else:
+                    status_html = (
+                        f'<div class="card-caption" style="color:#e63946 !important;'
+                        f'font-weight:700;">✗ No plume above threshold '
+                        f'({PARAMS["plume_threshold_ppm_m"]:.0f} ppm·m)</div>'
+                    )
                 st.markdown(
                     f'<div class="card-caption" style="font-weight:700;">'
-                    f'{dates_labels[sel_idx]} · Plume legend'
-                    f'</div>',
+                    f'{dates_labels[sel_idx]} · Plume outline'
+                    f'</div>{status_html}',
                     unsafe_allow_html=True,
                 )
+                st.image(
+                    enhancement_png(
+                        chosen["enhancement"],
+                        mask=chosen["plume_mask"],
+                        colormap="turbo",
+                        show_outline=_has_plume,
+                        vmin=shared_vmin,
+                        vmax=shared_vmax,
+                    ),
+                    use_container_width=True,
+                    output_format="PNG",
+                )
                 st.markdown(
-                    legend_html("plume", cvmin, cvmax,
+                    legend_html("plume",
                                 n_pixels=chosen["flux"]["n_pixels"],
                                 mean_enh=chosen["flux"]["mean_enhancement"]),
                     unsafe_allow_html=True,
@@ -1674,6 +1791,7 @@ if "emit_result" in st.session_state:
                         r["date"].strftime("%Y-%m-%d")
                         if r["date"] else f"#{idx+1}"
                     )
+                    _has = r["flux"]["n_pixels"] > 0
                     with gcols[gc]:
                         st.markdown(
                             f'<div class="card-caption" style="font-weight:700; '
@@ -1689,7 +1807,9 @@ if "emit_result" in st.session_state:
                                 r["enhancement"],
                                 mask=r["plume_mask"],
                                 colormap="turbo",
-                                show_outline=True,
+                                show_outline=_has,
+                                vmin=shared_vmin,
+                                vmax=shared_vmax,
                             ),
                             use_container_width=True,
                             output_format="PNG",
