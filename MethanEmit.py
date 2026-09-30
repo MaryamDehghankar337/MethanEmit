@@ -18,9 +18,10 @@ import folium
 import numpy as np
 import pandas as pd
 import rasterio
+import requests
 import streamlit as st
-from folium.plugins import Draw
-from shapely.geometry import box, mapping, shape
+from folium.plugins import Draw, MousePosition
+from shapely.geometry import box, mapping, shape, Point
 from shapely.ops import unary_union
 from streamlit_folium import st_folium
 
@@ -91,12 +92,24 @@ def aoi_bounds(aoi):
     return shape(ensure_aoi(aoi)).bounds
 
 
+def compute_zoom(bounds):
+    """Pick a reasonable zoom level based on AOI span."""
+    try:
+        minx, miny, maxx, maxy = bounds
+        span = max(maxx - minx, maxy - miny, 1e-6)
+        zoom = int(round(math.log2(360.0 / span))) - 1
+        return max(3, min(15, zoom))
+    except Exception:
+        return 11
+
+
 def create_map(aoi):
     geometry = shape(ensure_aoi(aoi))
     centroid = geometry.centroid
+    zoom = compute_zoom(geometry.bounds)
     fmap = folium.Map(
         [centroid.y, centroid.x],
-        zoom_start=11,
+        zoom_start=zoom,
         tiles="OpenStreetMap",
     )
     folium.GeoJson(
@@ -117,7 +130,66 @@ def create_map(aoi):
         },
         edit_options={"edit": True, "remove": True},
     ).add_to(fmap)
+    # Real-time mouse coordinates (bottom-right of the map)
+    MousePosition(
+        position="bottomright",
+        separator=" | ",
+        prefix="📍 Lat, Lon:",
+        lat_formatter="function(num) {return num.toFixed(5);}",
+        lng_formatter="function(num) {return num.toFixed(5);}",
+    ).add_to(fmap)
     return fmap
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  GEOCODING (place name → AOI)
+# ══════════════════════════════════════════════════════════════════════
+
+def geocode_place(query: str):
+    """Geocode a place name via Nominatim (OpenStreetMap).
+
+    Returns (geometry, (lat, lon), label) or (None, None, None).
+    """
+    try:
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {
+            "q": query,
+            "format": "json",
+            "limit": 1,
+            "polygon_geojson": 1,
+        }
+        headers = {"User-Agent": "EMIT-Methane-App/1.0 (streamlit)"}
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return None, None, None
+        item = data[0]
+        lat = float(item["lat"])
+        lon = float(item["lon"])
+        label = item.get("display_name", query)
+
+        # Prefer polygon geometry
+        gj = item.get("geojson")
+        if gj and gj.get("type") in ("Polygon", "MultiPolygon"):
+            try:
+                geom = shape(gj)
+                if not geom.is_empty:
+                    return geom, (lat, lon), label
+            except Exception:
+                pass
+
+        # Fallback: bounding box
+        bb = item.get("boundingbox")
+        if bb:
+            south, north, west, east = [float(x) for x in bb]
+            return box(west, south, east, north), (lat, lon), label
+
+        # Final fallback: small box
+        d = 0.02
+        return box(lon - d, lat - d, lon + d, lat + d), (lat, lon), label
+    except Exception:
+        return None, None, None
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -419,7 +491,7 @@ st.markdown("""
 .stApp p, .stApp label, .stApp small, .stApp strong, .stApp em, .stApp li, .stApp td, .stApp th, .stApp [data-testid="stMarkdownContainer"], .stApp [data-testid="stMarkdownContainer"] p, .stApp [data-testid="stMarkdownContainer"] span, .stApp [data-testid="stMarkdownContainer"] li { color: #111111 !important; }
 div[data-testid="stDateInput"] div[data-baseweb="input"], div[data-testid="stDateInput"] div[data-baseweb="input"] > div, div[data-testid="stDateInput"] input, div[data-testid="stDateInput"] input[type="text"], .stDateInput div[data-baseweb="input"], .stDateInput div[data-baseweb="input"] > div, .stDateInput input, .stDateInput input[type="text"] { background-color: var(--dark-field) !important; color: #ffffff !important; -webkit-text-fill-color: #ffffff !important; caret-color: #ffffff !important; opacity: 1 !important; }
 div[data-testid="stDateInput"] input::-webkit-datetime-edit, div[data-testid="stDateInput"] input::-webkit-datetime-edit-text, div[data-testid="stDateInput"] input::-webkit-datetime-edit-month-field, div[data-testid="stDateInput"] input::-webkit-datetime-edit-day-field, div[data-testid="stDateInput"] input::-webkit-datetime-edit-year-field, div[data-testid="stDateInput"] input::-webkit-datetime-edit-fields-wrapper, .stDateInput input::-webkit-datetime-edit, .stDateInput input::-webkit-datetime-edit-text, .stDateInput input::-webkit-datetime-edit-month-field, .stDateInput input::-webkit-datetime-edit-day-field, .stDateInput input::-webkit-datetime-edit-year-field, .stDateInput input::-webkit-datetime-edit-fields-wrapper { color: #ffffff !important; -webkit-text-fill-color: #ffffff !important; opacity: 1 !important; }
-div[data-testid="stNumberInput"] input, .stNumberInput input { background-color: var(--dark-field) !important; color: #ffffff !important; -webkit-text-fill-color: #ffffff !important; caret-color: #ffffff !important; }
+div[data-testid="stNumberInput"] input, div[data-testid="stTextInput"] input, .stNumberInput input, .stTextInput input { background-color: var(--dark-field) !important; color: #ffffff !important; -webkit-text-fill-color: #ffffff !important; caret-color: #ffffff !important; }
 input::placeholder, textarea::placeholder { color: #bfc3cc !important; opacity: 1 !important; }
 div[data-baseweb="select"] input, div[data-baseweb="select"] [role="combobox"], div[data-baseweb="select"] * { color: #111111 !important; }
 div[data-baseweb="popover"] [role="listbox"], div[data-baseweb="popover"] ul[role="listbox"], div[data-baseweb="popover"] [role="option"], div[data-baseweb="popover"] li[role="option"] { background: #111318 !important; }
@@ -450,6 +522,7 @@ div[data-testid="stDataFrame"] * { color: #111111 !important; }
 .result-tag { display: inline-block; background: #a8dadc; color: #111111 !important; border-radius: 999px; padding: 0.12rem 0.45rem; font-size: 0.6rem; font-weight: 800; letter-spacing: 0.03em; margin-bottom: 0.2rem; }
 .result-name { color: #111111 !important; font-size: 0.9rem; font-weight: 800; margin-bottom: 0.35rem; }
 .result-note { background: #f8fbfb; border: 1px solid #d7e4e7; border-radius: 10px; padding: 0.55rem 0.7rem; font-size: 0.8rem; color: #111111 !important; margin-top: 0.45rem; }
+.mouse-readout { background: #f8fbfb; border: 1px dashed #a8dadc; border-radius: 9px; padding: 0.35rem 0.6rem; font-size: 0.74rem; color: #111111 !important; margin-top: 0.35rem; }
 footer { visibility: hidden; }
 .stMarkdown { margin-bottom: 0.1rem; }
 .element-container { margin-bottom: 0.15rem; }
@@ -489,22 +562,123 @@ with map_col:
     st.markdown('<div class="section-label">01 · STUDY AREA</div>', unsafe_allow_html=True)
     st.markdown('<div class="card-title">Area of Interest</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="card-caption">Draw the study area directly on the map '
-        'using the polygon tool. Use the trash icon to delete and redraw.</div>',
+        '<div class="card-caption">Search by place name, enter coordinates manually, '
+        'or draw the study area directly on the map with the polygon tool. '
+        'Live mouse coordinates appear in the bottom-right corner of the map.</div>',
         unsafe_allow_html=True,
     )
+
+    # ── Place name search ────────────────────────────────────────────
+    ps1, ps2 = st.columns([3, 1], gap="small")
+    with ps1:
+        place_query = st.text_input(
+            "Place name",
+            placeholder="e.g. Tehran, Paris, Permian Basin, Riyadh…",
+            key="place_query",
+            label_visibility="collapsed",
+        )
+    with ps2:
+        search_place_clicked = st.button(
+            "🔍 Find place",
+            use_container_width=True,
+            key="search_place_btn",
+        )
+
+    if search_place_clicked:
+        if not place_query.strip():
+            st.warning("Please type a place name first.")
+        else:
+            with st.spinner("Geocoding place name…"):
+                geom, center, label = geocode_place(place_query.strip())
+            if geom is not None:
+                st.session_state.aoi = mapping(geom)
+                st.session_state["aoi_source"] = f"Place: {label[:90]}"
+                st.session_state["_ignore_drawings_once"] = True
+                st.success(f"Found: {label[:120]}")
+            else:
+                st.warning(
+                    "Place not found. Try a more specific name or use coordinates."
+                )
+
+    # ── Manual coordinates ───────────────────────────────────────────
+    with st.expander("📍 Or enter coordinates manually"):
+        mc1, mc2, mc3 = st.columns(3, gap="small")
+        with mc1:
+            manual_lat = st.number_input(
+                "Latitude",
+                value=35.50, min_value=-90.0, max_value=90.0,
+                step=0.01, format="%.4f", key="manual_lat",
+            )
+        with mc2:
+            manual_lon = st.number_input(
+                "Longitude",
+                value=51.30, min_value=-180.0, max_value=180.0,
+                step=0.01, format="%.4f", key="manual_lon",
+            )
+        with mc3:
+            manual_size = st.number_input(
+                "Half-size (°)",
+                value=0.10, min_value=0.005, max_value=5.0,
+                step=0.005, format="%.3f", key="manual_size",
+            )
+        if st.button("Apply coordinates", use_container_width=True, key="apply_coords"):
+            st.session_state.aoi = mapping(box(
+                manual_lon - manual_size, manual_lat - manual_size,
+                manual_lon + manual_size, manual_lat + manual_size,
+            ))
+            st.session_state["aoi_source"] = (
+                f"Manual: ({manual_lat:.4f}, {manual_lon:.4f}) ± {manual_size:.3f}°"
+            )
+            st.session_state["_ignore_drawings_once"] = True
+            st.success("AOI set from coordinates.")
+
+    # ── Current AOI indicator ────────────────────────────────────────
+    if st.session_state.get("aoi_source"):
+        st.markdown(
+            f'<div class="card-caption">Current AOI: '
+            f'<b>{st.session_state["aoi_source"]}</b></div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Map ──────────────────────────────────────────────────────────
     map_data = st_folium(
         create_map(st.session_state.aoi),
         height=385,
         width=1000,
         key="aoi_map",
     )
-    if map_data and map_data.get("all_drawings"):
+
+    ignore_drawings = st.session_state.pop("_ignore_drawings_once", False)
+    if not ignore_drawings and map_data and map_data.get("all_drawings"):
         new_aoi = normalize_geometry(
             {"type": "FeatureCollection", "features": map_data["all_drawings"]}
         )
         if new_aoi and new_aoi != st.session_state.aoi:
             st.session_state.aoi = new_aoi
+            st.session_state["aoi_source"] = "Custom polygon (drawn)"
+            st.rerun()
+
+    # ── Mouse position readout below the map ─────────────────────────
+    last_clicked = map_data.get("last_clicked") if map_data else None
+    if last_clicked:
+        lat_c = last_clicked.get("lat")
+        lon_c = last_clicked.get("lng")
+        st.markdown(
+            f'<div class="mouse-readout">'
+            f'🖱️ Last click &nbsp;→&nbsp; '
+            f'<b>Lat:</b> {lat_c:.5f} &nbsp;·&nbsp; <b>Lon:</b> {lon_c:.5f}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="mouse-readout">'
+            '🖱️ Live mouse coordinates shown in the bottom-right corner of the map. '
+            'Click on the map to pin a coordinate here.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
     st.markdown('</div>', unsafe_allow_html=True)
 
 with control_col:
@@ -1006,3 +1180,316 @@ if "emit_results" in st.session_state and st.session_state.emit_results:
         m3.metric("Plume area (km²)", f"{chosen['flux']['plume_area_m2']/1e6:.3f}")
 
     st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  07 · 30-DAY PLUME EVOLUTION  (NEW)
+# ══════════════════════════════════════════════════════════════════════
+
+if "emit_result" in st.session_state:
+    _res = st.session_state.emit_result
+    _ref_dt = _res.get("granule_dt")
+
+    if _ref_dt is not None:
+        st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="app-card">', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-label">07 · 30-DAY PLUME EVOLUTION</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div class="card-title">Methane plume changes around the detected date</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div class="card-caption">'
+            f'Searches all EMIT granules within a ±<i>N</i>-day window around '
+            f'<b>{_ref_dt.strftime("%Y-%m-%d %H:%M")}</b> and shows how the plume '
+            f'appears, disappears, moves, and grows or shrinks across the window.'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        ec1, ec2 = st.columns([1, 1], gap="small")
+        with ec1:
+            window_days = st.slider(
+                "Window around detected date (± days)",
+                min_value=5, max_value=45, value=15, step=1,
+                key="evo_window_days",
+            )
+        with ec2:
+            max_evo = st.slider(
+                "Max granules to process",
+                min_value=2, max_value=40, value=12, step=1,
+                key="evo_max_granules",
+            )
+
+        run_evo = st.button(
+            "🔁  Analyze plume evolution",
+            type="primary",
+            use_container_width=True,
+            key="run_evolution",
+        )
+
+        if run_evo:
+            start_d = (_ref_dt - timedelta(days=int(window_days))).date()
+            end_d = (_ref_dt + timedelta(days=int(window_days))).date()
+
+            progress = st.progress(0, text="Searching EMIT granules…")
+            try:
+                login_earthdata()
+                evo_granules = search_emit_granules(
+                    st.session_state.aoi, start_d, end_d
+                )
+                # Sort chronologically
+                evo_granules = sorted(
+                    evo_granules,
+                    key=lambda g: granule_datetime(g) or datetime.min,
+                )
+                evo_granules = evo_granules[: int(max_evo)]
+
+                if not evo_granules:
+                    progress.progress(100, text="No granules found")
+                    st.warning(
+                        "No EMIT granules found in this window. Try a wider ± window."
+                    )
+                else:
+                    evo_results = []
+                    for i, g in enumerate(evo_granules):
+                        progress.progress(
+                            int(100 * (i + 1) / len(evo_granules)),
+                            text=f"Processing {i+1}/{len(evo_granules)}…",
+                        )
+                        try:
+                            data, tform, tcrs = load_emit_enhancement(
+                                g, st.session_state.aoi
+                            )
+                            if data is None or data.size == 0:
+                                continue
+                            pm = detect_plume(
+                                data,
+                                PARAMS["plume_threshold_ppm_m"],
+                                int(PARAMS["min_plume_pixels"]),
+                            )
+                            f = estimate_flux_ime(
+                                data, pm, PARAMS["wind_speed_m_s"]
+                            )
+
+                            # Plume centroid (pixel + geographic if possible)
+                            centroid_px = None
+                            centroid_geo = None
+                            if pm.any():
+                                ys, xs = np.nonzero(pm)
+                                cx_px = float(xs.mean())
+                                cy_px = float(ys.mean())
+                                centroid_px = (cx_px, cy_px)
+                                try:
+                                    from rasterio.transform import xy as rio_xy
+                                    gx, gy = rio_xy(
+                                        tform, cy_px, cx_px, offset="center"
+                                    )
+                                    centroid_geo = (float(gx), float(gy))
+                                except Exception:
+                                    pass
+
+                            evo_results.append({
+                                "date": granule_datetime(g),
+                                "enhancement": data,
+                                "plume_mask": pm,
+                                "flux": f,
+                                "transform": tform,
+                                "crs": tcrs,
+                                "centroid_px": centroid_px,
+                                "centroid_geo": centroid_geo,
+                            })
+                        except Exception:
+                            continue
+
+                    st.session_state.evo_results = evo_results
+                    st.session_state.evo_ref_date = _ref_dt
+                    st.session_state.evo_window_days_used = int(window_days)
+                    progress.progress(100, text="Done")
+                    st.success(
+                        f"Processed {len(evo_results)} granule(s) in a "
+                        f"±{int(window_days)}-day window"
+                    )
+            except Exception as e:
+                st.error(f"Evolution analysis failed: {e}")
+
+        if st.session_state.get("evo_results"):
+            evo = st.session_state.evo_results
+            used_window = st.session_state.get("evo_window_days_used", window_days)
+
+            # ── Summary ──────────────────────────────────────────────
+            n_total = len(evo)
+            n_with = sum(1 for r in evo if r["flux"]["n_pixels"] > 0)
+            n_flare_only = n_total - n_with
+            st.markdown(
+                f'<div class="result-note">'
+                f'<b>{n_with}</b> of <b>{n_total}</b> observation(s) in the '
+                f'±{used_window}-day window showed a detectable plume. '
+                f'<b>{n_flare_only}</b> observation(s) showed no plume above the '
+                f'threshold of {PARAMS["plume_threshold_ppm_m"]:.0f} ppm·m.'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            # ── Time series ──────────────────────────────────────────
+            rows = []
+            for r in evo:
+                rows.append({
+                    "date": r["date"],
+                    "flux_kg_h": r["flux"]["Q_kg_h"],
+                    "plume_pixels": r["flux"]["n_pixels"],
+                    "plume_area_km2": r["flux"]["plume_area_m2"] / 1e6,
+                    "max_enh_ppmm": r["flux"]["max_enhancement"],
+                    "has_plume": int(r["flux"]["n_pixels"] > 0),
+                })
+            evo_df = pd.DataFrame(rows)
+            if not evo_df.empty and evo_df["date"].notna().any():
+                evo_df = evo_df.sort_values("date").set_index("date")
+
+                st.markdown("##### Flux evolution")
+                st.line_chart(evo_df[["flux_kg_h"]], use_container_width=True, height=220)
+
+                st.markdown("##### Plume area evolution")
+                st.line_chart(evo_df[["plume_area_km2"]], use_container_width=True, height=200)
+
+                st.dataframe(
+                    evo_df,
+                    use_container_width=True,
+                    hide_index=False,
+                    column_config={
+                        "flux_kg_h": st.column_config.NumberColumn("Flux (kg/h)", format="%.1f"),
+                        "plume_pixels": st.column_config.NumberColumn("Pixels", format="%d"),
+                        "plume_area_km2": st.column_config.NumberColumn("Area (km²)", format="%.3f"),
+                        "max_enh_ppmm": st.column_config.NumberColumn("Max enh.", format="%.0f"),
+                        "has_plume": st.column_config.NumberColumn("Plume?", format="%d"),
+                    },
+                )
+
+                st.download_button(
+                    "⬇ Download evolution CSV",
+                    evo_df.to_csv(),
+                    file_name="emit_plume_evolution.csv",
+                    mime="text/csv",
+                    key="dl_evo_csv",
+                    use_container_width=False,
+                )
+
+            # ── Plume centroid movement (if geographic coords available) ─
+            geo_pts = [
+                (r["date"], r["centroid_geo"])
+                for r in evo
+                if r.get("centroid_geo") is not None and r.get("date") is not None
+            ]
+            if len(geo_pts) >= 2:
+                st.markdown("##### Plume centroid movement")
+                crows = []
+                for d, (gx, gy) in geo_pts:
+                    crows.append({
+                        "date": d,
+                        "x": gx,
+                        "y": gy,
+                    })
+                cdf = pd.DataFrame(crows).sort_values("date")
+                # Approximate centroid shift in pixels (relative to first)
+                x0, y0 = cdf.iloc[0]["x"], cdf.iloc[0]["y"]
+                cdf["dx_px"] = (cdf["x"] - x0) / RESOLUTION
+                cdf["dy_px"] = (cdf["y"] - y0) / RESOLUTION
+                st.dataframe(
+                    cdf[["date", "dx_px", "dy_px"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "dx_px": st.column_config.NumberColumn("ΔX (px)", format="%.2f"),
+                        "dy_px": st.column_config.NumberColumn("ΔY (px)", format="%.2f"),
+                    },
+                )
+
+            # ── Interactive date slider ──────────────────────────────
+            st.markdown("##### Visual evolution")
+            dates_labels = [
+                r["date"].strftime("%Y-%m-%d") if r["date"] else f"#{i+1}"
+                for i, r in enumerate(evo)
+            ]
+            sel_idx = st.select_slider(
+                "Select observation",
+                options=list(range(len(evo))),
+                format_func=lambda x: dates_labels[x],
+                value=0,
+                key="evo_slider",
+            )
+            chosen = evo[sel_idx]
+            cc1, cc2 = st.columns(2, gap="small")
+            with cc1:
+                st.markdown(
+                    f'<div class="card-caption" style="font-weight:700;">'
+                    f'{dates_labels[sel_idx]} · Enhancement'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                st.image(
+                    enhancement_png(chosen["enhancement"], mask=None, colormap="turbo"),
+                    use_container_width=True,
+                    output_format="PNG",
+                )
+            with cc2:
+                st.markdown(
+                    f'<div class="card-caption" style="font-weight:700;">'
+                    f'{dates_labels[sel_idx]} · Plume mask'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                st.image(
+                    enhancement_png(
+                        chosen["enhancement"],
+                        mask=chosen["plume_mask"],
+                        colormap="turbo",
+                    ),
+                    use_container_width=True,
+                    output_format="PNG",
+                )
+            em1, em2, em3, em4 = st.columns(4, gap="small")
+            em1.metric("Flux (kg/h)", f"{chosen['flux']['Q_kg_h']:.1f}")
+            em2.metric("Plume pixels", f"{chosen['flux']['n_pixels']:,}")
+            em3.metric("Plume area (km²)", f"{chosen['flux']['plume_area_m2']/1e6:.3f}")
+            em4.metric("Max enh. (ppm·m)", f"{chosen['flux']['max_enhancement']:.0f}")
+
+            # ── Small multiples grid ─────────────────────────────────
+            st.markdown("##### Plume mask gallery (all observations)")
+            n_cols = 5
+            n_obs = len(evo)
+            grid_rows = (n_obs + n_cols - 1) // n_cols
+            for gr in range(grid_rows):
+                gcols = st.columns(n_cols, gap="small")
+                for gc in range(n_cols):
+                    idx = gr * n_cols + gc
+                    if idx >= n_obs:
+                        break
+                    r = evo[idx]
+                    label = (
+                        r["date"].strftime("%Y-%m-%d")
+                        if r["date"] else f"#{idx+1}"
+                    )
+                    with gcols[gc]:
+                        st.markdown(
+                            f'<div class="card-caption" style="font-weight:700; '
+                            f'text-align:center; margin-bottom:0.15rem;">'
+                            f'{label}<br/>'
+                            f'<span style="font-weight:400;">'
+                            f'{r["flux"]["Q_kg_h"]:.0f} kg/h · '
+                            f'{r["flux"]["n_pixels"]} px</span></div>',
+                            unsafe_allow_html=True,
+                        )
+                        st.image(
+                            enhancement_png(
+                                r["enhancement"],
+                                mask=r["plume_mask"],
+                                colormap="turbo",
+                            ),
+                            use_container_width=True,
+                            output_format="PNG",
+                        )
+
+        st.markdown('</div>', unsafe_allow_html=True)
