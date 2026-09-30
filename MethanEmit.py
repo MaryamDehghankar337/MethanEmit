@@ -93,7 +93,6 @@ def aoi_bounds(aoi):
 
 
 def compute_zoom(bounds):
-    """Pick a reasonable zoom level based on AOI span."""
     try:
         minx, miny, maxx, maxy = bounds
         span = max(maxx - minx, maxy - miny, 1e-6)
@@ -130,7 +129,6 @@ def create_map(aoi):
         },
         edit_options={"edit": True, "remove": True},
     ).add_to(fmap)
-    # Real-time mouse coordinates (bottom-right of the map)
     MousePosition(
         position="bottomright",
         separator=" | ",
@@ -146,10 +144,6 @@ def create_map(aoi):
 # ══════════════════════════════════════════════════════════════════════
 
 def geocode_place(query: str):
-    """Geocode a place name via Nominatim (OpenStreetMap).
-
-    Returns (geometry, (lat, lon), label) or (None, None, None).
-    """
     try:
         url = "https://nominatim.openstreetmap.org/search"
         params = {
@@ -169,7 +163,6 @@ def geocode_place(query: str):
         lon = float(item["lon"])
         label = item.get("display_name", query)
 
-        # Prefer polygon geometry
         gj = item.get("geojson")
         if gj and gj.get("type") in ("Polygon", "MultiPolygon"):
             try:
@@ -179,13 +172,11 @@ def geocode_place(query: str):
             except Exception:
                 pass
 
-        # Fallback: bounding box
         bb = item.get("boundingbox")
         if bb:
             south, north, west, east = [float(x) for x in bb]
             return box(west, south, east, north), (lat, lon), label
 
-        # Final fallback: small box
         d = 0.02
         return box(lon - d, lat - d, lon + d, lat + d), (lat, lon), label
     except Exception:
@@ -279,6 +270,7 @@ def granule_cloud(granule) -> float:
 
 
 def load_emit_enhancement(granule, aoi):
+    """Load EMIT enhancement clipped to AOI, with nodata masked to NaN."""
     try:
         files = earthaccess.open([granule])
     except Exception as e:
@@ -299,6 +291,7 @@ def load_emit_enhancement(granule, aoi):
     minx, miny, maxx, maxy = aoi_bounds(aoi)
 
     with rasterio.open(tif_path) as src:
+        nodata = src.nodata
         try:
             from rasterio.windows import from_bounds
             window = from_bounds(minx, miny, maxx, maxy, src.transform)
@@ -311,7 +304,38 @@ def load_emit_enhancement(granule, aoi):
             transform = src.transform
             crs = src.crs
 
-    return data.astype(np.float32), transform, crs
+    data = data.astype(np.float32)
+
+    # ── Mask nodata / fill values so they don't pollute the calculation ──
+    if nodata is not None:
+        try:
+            nd = float(nodata)
+            data = np.where(np.isclose(data, nd, rtol=0, atol=1e-3),
+                            np.nan, data)
+        except Exception:
+            pass
+
+    for fv in (-9999.0, -999.0, -99999.0):
+        data = np.where(np.isclose(data, fv, rtol=0, atol=1e-3),
+                        np.nan, data)
+
+    # Physically implausible magnitudes (EMIT enhancement is in ppm·m)
+    data = np.where(np.abs(data) > 1e6, np.nan, data)
+
+    # Optionally clip to AOI polygon (removes edges outside drawn polygon)
+    try:
+        from rasterio.features import geometry_mask
+        geom_mask = geometry_mask(
+            [shape(ensure_aoi(aoi))],
+            out_shape=data.shape,
+            transform=transform,
+            invert=True,
+        )
+        data = np.where(geom_mask, data, np.nan)
+    except Exception:
+        pass
+
+    return data, transform, crs
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -319,7 +343,12 @@ def load_emit_enhancement(granule, aoi):
 # ══════════════════════════════════════════════════════════════════════
 
 def detect_plume(enhancement, threshold_ppm_m, min_pixels):
-    from scipy.ndimage import label as nd_label
+    """Detect plumes: threshold → denoise → keep components ≥ min_pixels."""
+    from scipy.ndimage import (
+        label as nd_label,
+        binary_opening,
+        binary_closing,
+    )
 
     finite = np.isfinite(enhancement)
     candidate = finite & (enhancement > threshold_ppm_m)
@@ -329,6 +358,15 @@ def detect_plume(enhancement, threshold_ppm_m, min_pixels):
         return plume
 
     structure = np.ones((3, 3), dtype=np.uint8)
+
+    # Remove single-pixel speckles (opening)
+    candidate = binary_opening(candidate, structure=structure, iterations=1)
+    # Fill small holes inside plumes (closing)
+    candidate = binary_closing(candidate, structure=structure, iterations=1)
+
+    if not candidate.any():
+        return plume
+
     labeled, n = nd_label(candidate, structure=structure)
     if n == 0:
         return plume
@@ -343,7 +381,8 @@ def detect_plume(enhancement, threshold_ppm_m, min_pixels):
 
 
 def estimate_flux_ime(enhancement, plume_mask, wind_speed_m_s):
-    if not plume_mask.any():
+    """IME-based flux estimation with proper handling of NaN pixels."""
+    if plume_mask is None or not plume_mask.any():
         return {
             "Q_kg_h": 0.0,
             "Q_ton_h": 0.0,
@@ -354,20 +393,34 @@ def estimate_flux_ime(enhancement, plume_mask, wind_speed_m_s):
             "U_eff_m_s": 0.0,
             "n_pixels": 0,
             "max_enhancement": 0.0,
+            "mean_enhancement": 0.0,
+        }
+
+    # Only sum over valid plume pixels
+    valid_plume = plume_mask & np.isfinite(enhancement)
+    n_pix = int(valid_plume.sum())
+    if n_pix == 0:
+        return {
+            "Q_kg_h": 0.0, "Q_ton_h": 0.0,
+            "IME_ppm_m2": 0.0, "IME_kg": 0.0,
+            "plume_area_m2": 0.0, "length_m": 0.0,
+            "U_eff_m_s": 0.0, "n_pixels": 0,
+            "max_enhancement": 0.0, "mean_enhancement": 0.0,
         }
 
     pixel_area = RESOLUTION * RESOLUTION
-    vals = np.where(plume_mask, np.nan_to_num(enhancement, nan=0.0), 0.0)
+    vals = np.where(valid_plume, enhancement, 0.0)
     IME_ppm_m2 = float(np.sum(vals) * pixel_area)
     IME_kg = IME_ppm_m2 * 1e-6 * CH4_DENSITY_KG_M3
 
-    n_pix = int(plume_mask.sum())
     A_plume = n_pix * pixel_area
     L = float(np.sqrt(A_plume)) if A_plume > 0 else 1.0
     U_eff = ALPHA_IME * wind_speed_m_s + BETA_IME
 
     Q_kg_s = U_eff * IME_kg / L if L > 0 else 0.0
     Q_kg_h = Q_kg_s * 3600.0
+
+    plume_vals = enhancement[valid_plume]
 
     return {
         "Q_kg_h": Q_kg_h,
@@ -378,7 +431,8 @@ def estimate_flux_ime(enhancement, plume_mask, wind_speed_m_s):
         "length_m": L,
         "U_eff_m_s": U_eff,
         "n_pixels": n_pix,
-        "max_enhancement": float(np.nanmax(vals)) if vals.size else 0.0,
+        "max_enhancement": float(np.nanmax(plume_vals)),
+        "mean_enhancement": float(np.nanmean(plume_vals)),
     }
 
 
@@ -386,68 +440,133 @@ def estimate_flux_ime(enhancement, plume_mask, wind_speed_m_s):
 #  IMAGE RENDERING
 # ══════════════════════════════════════════════════════════════════════
 
-def enhancement_png(array, mask=None, colormap="turbo"):
-    """Render enhancement with a nicer colormap and optional plume overlay."""
+def _compute_vrange(data):
+    """Robust percentile-based range for rendering & legends."""
+    finite = np.isfinite(data)
+    if not finite.any():
+        return 0.0, 1.0
+    values = data[finite]
+    low, high = np.percentile(values, [2, 98])
+    if high <= low:
+        low, high = float(values.min()), float(values.max())
+    if high <= low:
+        high = low + 1.0
+    return float(low), float(high)
+
+
+def enhancement_png(
+    array,
+    mask=None,
+    colormap="turbo",
+    show_outline=True,
+    outline_color=(255, 255, 0),
+):
+    """Render enhancement with optional plume overlay + yellow outline."""
     from PIL import Image
     import matplotlib.pyplot as plt
 
     data = np.asarray(array, dtype=np.float32)
     finite = np.isfinite(data)
     rgb = np.full((*data.shape, 3), 255, dtype=np.uint8)
-    if finite.any():
-        values = data[finite]
-        low, high = np.percentile(values, [2, 98])
-        if high <= low:
-            low, high = float(values.min()), float(values.max())
-        if high > low:
-            norm = np.clip(
-                (np.nan_to_num(data, nan=low) - low) / (high - low), 0, 1
-            )
-            cmap = plt.get_cmap(colormap)
-            rgb = (cmap(norm)[:, :, :3] * 255).astype(np.uint8)
-            rgb[~finite] = 255
 
+    vmin, vmax = _compute_vrange(data)
+    if finite.any():
+        norm = np.clip(
+            (np.nan_to_num(data, nan=vmin) - vmin) / (vmax - vmin), 0, 1
+        )
+        cmap = plt.get_cmap(colormap)
+        rgb = (cmap(norm)[:, :, :3] * 255).astype(np.uint8)
+        rgb[~finite] = 255  # white = no data
+
+    # Optional soft red overlay + yellow outline for plume pixels
     if mask is not None and mask.any():
         overlay = np.zeros((*data.shape, 4), dtype=np.uint8)
         overlay[..., 0] = 230
         overlay[..., 1] = 40
         overlay[..., 2] = 40
-        overlay[..., 3] = np.where(mask, 170, 0).astype(np.uint8)
+        overlay[..., 3] = np.where(mask, 160, 0).astype(np.uint8)
         base = Image.fromarray(rgb).convert("RGBA")
         over = Image.fromarray(overlay, mode="RGBA")
         rgb = np.array(Image.alpha_composite(base, over).convert("RGB"))
+
+        if show_outline:
+            try:
+                from scipy.ndimage import binary_erosion, binary_dilation
+                eroded = binary_erosion(mask, iterations=1)
+                boundary = mask & ~eroded
+                boundary = binary_dilation(boundary, iterations=1)
+                rgb[boundary] = outline_color
+            except Exception:
+                pass
 
     buffer = io.BytesIO()
     Image.fromarray(rgb).save(buffer, format="PNG")
     return buffer.getvalue()
 
 
-def legend_html(kind):
+def colorbar_png(vmin, vmax, colormap="turbo", label="CH₄ enhancement (ppm·m)"):
+    """Generate a real colorbar PNG matching the enhancement rendering."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(0.9, 3.2), dpi=100)
+    norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
+    cb = matplotlib.colorbar.ColorbarBase(
+        ax, cmap=colormap, norm=norm, orientation="vertical"
+    )
+    cb.set_label(label, fontsize=8, color="#111111")
+    cb.ax.tick_params(labelsize=7, colors="#111111")
+    cb.outline.set_edgecolor("#555555")
+    fig.patch.set_facecolor("#ffffff")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="#ffffff")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def legend_html(kind, vmin=None, vmax=None, n_pixels=None, mean_enh=None):
     if kind == "plume":
         rows = [
-            ("#e63946", "Detected plume"),
-            ("#ffffff", "Background"),
+            ("#e63946", "Detected plume (fill)"),
+            ("#ffff00", "Plume boundary"),
+            ("#ffffff", "Background / no data"),
         ]
     elif kind == "enhancement":
+        lo = f"{vmin:.0f}" if vmin is not None else "low"
+        hi = f"{vmax:.0f}" if vmax is not None else "high"
         rows = [
-            ("#d7191c", "High CH4 enhancement"),
+            ("#d7191c", f"High CH₄ (≈ {hi} ppm·m)"),
             ("#f7f7f7", "Near zero"),
-            ("#2c7bb6", "Low / negative"),
+            ("#2c7bb6", f"Low / negative (≈ {lo} ppm·m)"),
+            ("#ffff00", "Plume boundary"),
         ]
     else:
         rows = [
             ("#d7191c", "High"),
             ("#ffffff", "No data"),
         ]
+
     items = "".join(
         f'<div class="legend-row">'
         f'<span class="legend-swatch" style="background:{c};"></span>'
         f'<span>{t}</span></div>'
         for c, t in rows
     )
+    extra = ""
+    if n_pixels is not None:
+        extra = (
+            f'<div class="legend-row" style="margin-top:0.35rem;">'
+            f'<b>Plume pixels:</b> {n_pixels:,}</div>'
+        )
+    if mean_enh is not None:
+        extra += (
+            f'<div class="legend-row">'
+            f'<b>Mean enh.:</b> {mean_enh:.0f} ppm·m</div>'
+        )
     return (
         f'<div class="result-legend">'
-        f'<div class="legend-heading">Legend</div>{items}</div>'
+        f'<div class="legend-heading">Legend</div>{items}{extra}</div>'
     )
 
 
@@ -503,20 +622,80 @@ div[data-baseweb="popover"] [role="option"]:hover, div[data-baseweb="popover"] l
 .stSlider [data-testid="stThumbValue"], .stSlider [data-testid="stThumbValue"] * { color: #ffffff !important; }
 [data-baseweb="calendar"] *, [data-baseweb="popover"] [data-baseweb="calendar"] *, [data-baseweb="calendar"] button { color: #ffffff !important; }
 input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:focus { -webkit-text-fill-color: #ffffff !important; caret-color: #ffffff !important; }
+
+/* ───── BUTTONS ───── */
+.stButton > button, .stDownloadButton > button {
+    border-radius: 9px;
+    min-height: 2.15rem;
+    font-weight: 750;
+    font-size: 0.78rem;
+}
+
+/* Primary (red) */
+.stButton > button[kind="primary"],
+.stDownloadButton > button[kind="primary"] {
+    background: #e63946 !important;
+    border: 1px solid #e63946 !important;
+    color: #ffffff !important;
+}
+.stButton > button[kind="primary"] *,
+.stDownloadButton > button[kind="primary"] * {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+}
+.stButton > button[kind="primary"]:hover,
+.stDownloadButton > button[kind="primary"]:hover {
+    background: #c92f3b !important;
+    border-color: #c92f3b !important;
+}
+
+/* Secondary (navy → white on hover) */
+.stButton > button[kind="secondary"],
+.stDownloadButton > button {
+    background: #1d3557 !important;
+    color: #ffffff !important;
+    border: 1px solid #1d3557 !important;
+}
+.stButton > button[kind="secondary"] *,
+.stDownloadButton > button * {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+}
+.stButton > button[kind="secondary"]:hover,
+.stDownloadButton > button:hover {
+    background: #ffffff !important;
+    color: #111111 !important;
+    border: 1px solid #1d3557 !important;
+}
+.stButton > button[kind="secondary"]:hover *,
+.stDownloadButton > button:hover * {
+    color: #111111 !important;
+    -webkit-text-fill-color: #111111 !important;
+}
+
+.stButton > button:disabled,
+.stDownloadButton > button:disabled { opacity: 0.55 !important; }
+
+/* Keep images inside their column */
+[data-testid="stImage"] {
+    max-width: 100% !important;
+    overflow: hidden;
+    border-radius: 6px;
+}
+[data-testid="stImage"] > img {
+    max-width: 100% !important;
+    height: auto !important;
+    display: block;
+}
+
 .auth-card { background: #f8fbfb; border: 1px solid #d7e4e7; border-radius: 11px; padding: 0.65rem 0.75rem; margin-top: 0.45rem; }
 .auth-status { background: #e8f7ea; border: 1px solid #9ed2a4; color: #155724 !important; border-radius: 9px; padding: 0.45rem 0.6rem; font-size: 0.76rem; font-weight: 700; margin-bottom: 0.45rem; }
 .auth-help { color: #111111 !important; font-size: 0.72rem; line-height: 1.45; margin: 0.2rem 0 0.45rem 0; }
-.stButton > button, .stDownloadButton > button { border-radius: 9px; min-height: 2.15rem; font-weight: 750; font-size: 0.78rem; color: #111111 !important; }
-.stButton > button[kind="primary"] { background: #e63946; border-color: #e63946; color: #ffffff !important; }
-.stButton > button[kind="primary"] *, .stDownloadButton > button[kind="primary"] * { color: #ffffff !important; }
-.stButton > button[kind="primary"]:hover { background: #c92f3b; border-color: #c92f3b; color: #ffffff !important; }
-.stDownloadButton > button { background: #ffffff; color: #111111 !important; border: 1px solid #a8dadc; }
-.stDownloadButton > button:hover { background: #f1faee; border-color: #457b9d; color: #111111 !important; }
 div[data-testid="stDataFrame"] { border: 1px solid var(--border); }
 div[data-testid="stDataFrame"] * { color: #111111 !important; }
 .result-legend { background: #ffffff; border: 1px solid #d7e4e7; border-radius: 10px; padding: 0.75rem 0.7rem; min-height: 96px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: center; gap: 0.42rem; }
 .result-legend .legend-heading { color: #111111 !important; font-size: 0.88rem; font-weight: 800; }
-.result-legend .legend-row { display: flex; align-items: center; gap: 0.45rem; color: #111111 !important; font-size: 0.82rem; line-height: 1.25; }
+.result-legend .legend-row { display: flex; align-items: center; gap: 0.45rem; color: #111111 !important; font-size: 0.78rem; line-height: 1.25; }
 .legend-swatch { width: 18px; height: 14px; min-width: 18px; border: 1px solid #555; border-radius: 2px; display: inline-block; }
 .result-card { background: #ffffff; border: 1px solid #d8e6e8; border-radius: 12px; padding: 0.6rem; }
 .result-tag { display: inline-block; background: #a8dadc; color: #111111 !important; border-radius: 999px; padding: 0.12rem 0.45rem; font-size: 0.6rem; font-weight: 800; letter-spacing: 0.03em; margin-bottom: 0.2rem; }
@@ -568,7 +747,6 @@ with map_col:
         unsafe_allow_html=True,
     )
 
-    # ── Place name search ────────────────────────────────────────────
     ps1, ps2 = st.columns([3, 1], gap="small")
     with ps1:
         place_query = st.text_input(
@@ -600,7 +778,6 @@ with map_col:
                     "Place not found. Try a more specific name or use coordinates."
                 )
 
-    # ── Manual coordinates ───────────────────────────────────────────
     with st.expander("📍 Or enter coordinates manually"):
         mc1, mc2, mc3 = st.columns(3, gap="small")
         with mc1:
@@ -632,7 +809,6 @@ with map_col:
             st.session_state["_ignore_drawings_once"] = True
             st.success("AOI set from coordinates.")
 
-    # ── Current AOI indicator ────────────────────────────────────────
     if st.session_state.get("aoi_source"):
         st.markdown(
             f'<div class="card-caption">Current AOI: '
@@ -640,7 +816,6 @@ with map_col:
             unsafe_allow_html=True,
         )
 
-    # ── Map ──────────────────────────────────────────────────────────
     map_data = st_folium(
         create_map(st.session_state.aoi),
         height=385,
@@ -658,7 +833,6 @@ with map_col:
             st.session_state["aoi_source"] = "Custom polygon (drawn)"
             st.rerun()
 
-    # ── Mouse position readout below the map ─────────────────────────
     last_clicked = map_data.get("last_clicked") if map_data else None
     if last_clicked:
         lat_c = last_clicked.get("lat")
@@ -900,6 +1074,8 @@ if "emit_result" in st.session_state:
     transform = result.get("transform")
     crs = result.get("crs")
 
+    vmin_enh, vmax_enh = _compute_vrange(enhancement)
+
     st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">05 · RESULTS</div>', unsafe_allow_html=True)
@@ -910,39 +1086,62 @@ if "emit_result" in st.session_state:
     metrics[2].metric("Plume pixels", f"{flux['n_pixels']:,}")
     metrics[3].metric("Plume area", f"{flux['plume_area_m2']/1e6:.3f} km²")
     metrics[4].metric("Max enh. (ppm·m)", f"{flux['max_enhancement']:.0f}")
-    metrics[5].metric("Threshold (ppm·m)", f"{result['threshold']:.0f}")
+    metrics[5].metric("Mean enh. (ppm·m)", f"{flux['mean_enhancement']:.0f}")
 
     rc1, rc2 = st.columns(2, gap="small")
     with rc1:
         st.markdown('<div class="result-card">', unsafe_allow_html=True)
         st.markdown('<div class="result-tag">Enhancement</div>', unsafe_allow_html=True)
-        st.markdown('<div class="result-name">CH4 Enhancement (ppm·m)</div>', unsafe_allow_html=True)
-        img_col, legend_col = st.columns([3.6, 1.0], gap="small")
+        st.markdown('<div class="result-name">CH₄ Enhancement (ppm·m)</div>', unsafe_allow_html=True)
+        img_col, legend_col = st.columns([3.4, 1.2], gap="small")
         with img_col:
             st.image(
-                enhancement_png(enhancement, mask=None, colormap="turbo"),
+                enhancement_png(enhancement, mask=plume_mask,
+                                colormap="turbo", show_outline=True),
                 use_container_width=True,
                 output_format="PNG",
             )
         with legend_col:
-            st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
-            st.markdown(legend_html("enhancement"), unsafe_allow_html=True)
+            st.markdown(
+                '<div style="padding-top:0.3rem;"></div>',
+                unsafe_allow_html=True,
+            )
+            st.image(
+                colorbar_png(vmin_enh, vmax_enh, "turbo"),
+                use_container_width=True,
+            )
+            st.markdown(
+                legend_html("plume", vmin_enh, vmax_enh,
+                            n_pixels=flux["n_pixels"],
+                            mean_enh=flux["mean_enhancement"]),
+                unsafe_allow_html=True,
+            )
         st.markdown('</div>', unsafe_allow_html=True)
 
     with rc2:
         st.markdown('<div class="result-card">', unsafe_allow_html=True)
         st.markdown('<div class="result-tag">Plume mask</div>', unsafe_allow_html=True)
-        st.markdown('<div class="result-name">Detected methane plume</div>', unsafe_allow_html=True)
-        img_col, legend_col = st.columns([3.6, 1.0], gap="small")
+        st.markdown('<div class="result-name">Detected methane plume (with outline)</div>', unsafe_allow_html=True)
+        img_col, legend_col = st.columns([3.4, 1.2], gap="small")
         with img_col:
             st.image(
-                enhancement_png(enhancement, mask=plume_mask, colormap="turbo"),
+                enhancement_png(enhancement, mask=plume_mask,
+                                colormap="turbo", show_outline=True,
+                                outline_color=(255, 255, 0)),
                 use_container_width=True,
                 output_format="PNG",
             )
         with legend_col:
-            st.markdown('<div style="padding-top:0.35rem;"></div>', unsafe_allow_html=True)
-            st.markdown(legend_html("plume"), unsafe_allow_html=True)
+            st.markdown(
+                '<div style="padding-top:0.3rem;"></div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                legend_html("plume", vmin_enh, vmax_enh,
+                            n_pixels=flux["n_pixels"],
+                            mean_enh=flux["mean_enhancement"]),
+                unsafe_allow_html=True,
+            )
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown(
@@ -959,10 +1158,12 @@ if "emit_result" in st.session_state:
     st.markdown("#### 📥 Download results")
     dl1, dl2, dl3, dl4 = st.columns(4, gap="small")
 
+    dt_str = result.get("granule_dt")
+    dt_tag = dt_str.strftime("%Y%m%d") if dt_str else "granule"
+
     with dl1:
-        png_data = enhancement_png(enhancement, mask=None, colormap="turbo")
-        dt_str = result.get("granule_dt")
-        dt_tag = dt_str.strftime("%Y%m%d") if dt_str else "granule"
+        png_data = enhancement_png(enhancement, mask=plume_mask,
+                                    colormap="turbo", show_outline=True)
         st.download_button(
             "⬇ Enhancement PNG",
             png_data,
@@ -973,7 +1174,8 @@ if "emit_result" in st.session_state:
         )
 
     with dl2:
-        png_mask = enhancement_png(enhancement, mask=plume_mask, colormap="turbo")
+        png_mask = enhancement_png(enhancement, mask=plume_mask,
+                                    colormap="turbo", show_outline=True)
         st.download_button(
             "⬇ Plume mask PNG",
             png_mask,
@@ -1149,6 +1351,7 @@ if "emit_results" in st.session_state and st.session_state.emit_results:
             key="batch_slider",
         )
         chosen = batch[selected_idx]
+        cvmin, cvmax = _compute_vrange(chosen["enhancement"])
         cc1, cc2 = st.columns(2, gap="small")
         with cc1:
             st.markdown(
@@ -1158,21 +1361,29 @@ if "emit_results" in st.session_state and st.session_state.emit_results:
                 unsafe_allow_html=True,
             )
             st.image(
-                enhancement_png(chosen["enhancement"], mask=None, colormap="turbo"),
+                enhancement_png(chosen["enhancement"], mask=chosen["plume_mask"],
+                                colormap="turbo", show_outline=True),
                 use_container_width=True,
                 output_format="PNG",
             )
+            st.image(colorbar_png(cvmin, cvmax, "turbo"), width=90)
         with cc2:
             st.markdown(
                 f'<div class="card-caption" style="font-weight:700;">'
-                f'{dates_labels[selected_idx]} · Plume mask'
+                f'{dates_labels[selected_idx]} · Plume outline'
                 f'</div>',
                 unsafe_allow_html=True,
             )
             st.image(
-                enhancement_png(chosen["enhancement"], mask=chosen["plume_mask"], colormap="turbo"),
+                enhancement_png(chosen["enhancement"], mask=chosen["plume_mask"],
+                                colormap="turbo", show_outline=True),
                 use_container_width=True,
                 output_format="PNG",
+            )
+            st.markdown(
+                legend_html("plume", n_pixels=chosen["flux"]["n_pixels"],
+                            mean_enh=chosen["flux"]["mean_enhancement"]),
+                unsafe_allow_html=True,
             )
         m1, m2, m3 = st.columns(3, gap="small")
         m1.metric("Flux (kg/h)", f"{chosen['flux']['Q_kg_h']:.1f}")
@@ -1183,7 +1394,7 @@ if "emit_results" in st.session_state and st.session_state.emit_results:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  07 · 30-DAY PLUME EVOLUTION  (NEW)
+#  07 · 30-DAY PLUME EVOLUTION
 # ══════════════════════════════════════════════════════════════════════
 
 if "emit_result" in st.session_state:
@@ -1241,7 +1452,6 @@ if "emit_result" in st.session_state:
                 evo_granules = search_emit_granules(
                     st.session_state.aoi, start_d, end_d
                 )
-                # Sort chronologically
                 evo_granules = sorted(
                     evo_granules,
                     key=lambda g: granule_datetime(g) or datetime.min,
@@ -1275,7 +1485,6 @@ if "emit_result" in st.session_state:
                                 data, pm, PARAMS["wind_speed_m_s"]
                             )
 
-                            # Plume centroid (pixel + geographic if possible)
                             centroid_px = None
                             centroid_geo = None
                             if pm.any():
@@ -1320,21 +1529,19 @@ if "emit_result" in st.session_state:
             evo = st.session_state.evo_results
             used_window = st.session_state.get("evo_window_days_used", window_days)
 
-            # ── Summary ──────────────────────────────────────────────
             n_total = len(evo)
             n_with = sum(1 for r in evo if r["flux"]["n_pixels"] > 0)
-            n_flare_only = n_total - n_with
+            n_without = n_total - n_with
             st.markdown(
                 f'<div class="result-note">'
                 f'<b>{n_with}</b> of <b>{n_total}</b> observation(s) in the '
                 f'±{used_window}-day window showed a detectable plume. '
-                f'<b>{n_flare_only}</b> observation(s) showed no plume above the '
+                f'<b>{n_without}</b> observation(s) showed no plume above the '
                 f'threshold of {PARAMS["plume_threshold_ppm_m"]:.0f} ppm·m.'
                 f'</div>',
                 unsafe_allow_html=True,
             )
 
-            # ── Time series ──────────────────────────────────────────
             rows = []
             for r in evo:
                 rows.append({
@@ -1343,6 +1550,7 @@ if "emit_result" in st.session_state:
                     "plume_pixels": r["flux"]["n_pixels"],
                     "plume_area_km2": r["flux"]["plume_area_m2"] / 1e6,
                     "max_enh_ppmm": r["flux"]["max_enhancement"],
+                    "mean_enh_ppmm": r["flux"]["mean_enhancement"],
                     "has_plume": int(r["flux"]["n_pixels"] > 0),
                 })
             evo_df = pd.DataFrame(rows)
@@ -1364,6 +1572,7 @@ if "emit_result" in st.session_state:
                         "plume_pixels": st.column_config.NumberColumn("Pixels", format="%d"),
                         "plume_area_km2": st.column_config.NumberColumn("Area (km²)", format="%.3f"),
                         "max_enh_ppmm": st.column_config.NumberColumn("Max enh.", format="%.0f"),
+                        "mean_enh_ppmm": st.column_config.NumberColumn("Mean enh.", format="%.0f"),
                         "has_plume": st.column_config.NumberColumn("Plume?", format="%d"),
                     },
                 )
@@ -1377,7 +1586,6 @@ if "emit_result" in st.session_state:
                     use_container_width=False,
                 )
 
-            # ── Plume centroid movement (if geographic coords available) ─
             geo_pts = [
                 (r["date"], r["centroid_geo"])
                 for r in evo
@@ -1387,13 +1595,8 @@ if "emit_result" in st.session_state:
                 st.markdown("##### Plume centroid movement")
                 crows = []
                 for d, (gx, gy) in geo_pts:
-                    crows.append({
-                        "date": d,
-                        "x": gx,
-                        "y": gy,
-                    })
+                    crows.append({"date": d, "x": gx, "y": gy})
                 cdf = pd.DataFrame(crows).sort_values("date")
-                # Approximate centroid shift in pixels (relative to first)
                 x0, y0 = cdf.iloc[0]["x"], cdf.iloc[0]["y"]
                 cdf["dx_px"] = (cdf["x"] - x0) / RESOLUTION
                 cdf["dy_px"] = (cdf["y"] - y0) / RESOLUTION
@@ -1407,7 +1610,6 @@ if "emit_result" in st.session_state:
                     },
                 )
 
-            # ── Interactive date slider ──────────────────────────────
             st.markdown("##### Visual evolution")
             dates_labels = [
                 r["date"].strftime("%Y-%m-%d") if r["date"] else f"#{i+1}"
@@ -1421,34 +1623,35 @@ if "emit_result" in st.session_state:
                 key="evo_slider",
             )
             chosen = evo[sel_idx]
+            cvmin, cvmax = _compute_vrange(chosen["enhancement"])
             cc1, cc2 = st.columns(2, gap="small")
             with cc1:
                 st.markdown(
                     f'<div class="card-caption" style="font-weight:700;">'
-                    f'{dates_labels[sel_idx]} · Enhancement'
+                    f'{dates_labels[sel_idx]} · Enhancement + outline'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
                 st.image(
-                    enhancement_png(chosen["enhancement"], mask=None, colormap="turbo"),
+                    enhancement_png(chosen["enhancement"],
+                                    mask=chosen["plume_mask"],
+                                    colormap="turbo", show_outline=True),
                     use_container_width=True,
                     output_format="PNG",
                 )
+                st.image(colorbar_png(cvmin, cvmax, "turbo"), width=90)
             with cc2:
                 st.markdown(
                     f'<div class="card-caption" style="font-weight:700;">'
-                    f'{dates_labels[sel_idx]} · Plume mask'
+                    f'{dates_labels[sel_idx]} · Plume legend'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
-                st.image(
-                    enhancement_png(
-                        chosen["enhancement"],
-                        mask=chosen["plume_mask"],
-                        colormap="turbo",
-                    ),
-                    use_container_width=True,
-                    output_format="PNG",
+                st.markdown(
+                    legend_html("plume", cvmin, cvmax,
+                                n_pixels=chosen["flux"]["n_pixels"],
+                                mean_enh=chosen["flux"]["mean_enhancement"]),
+                    unsafe_allow_html=True,
                 )
             em1, em2, em3, em4 = st.columns(4, gap="small")
             em1.metric("Flux (kg/h)", f"{chosen['flux']['Q_kg_h']:.1f}")
@@ -1456,9 +1659,8 @@ if "emit_result" in st.session_state:
             em3.metric("Plume area (km²)", f"{chosen['flux']['plume_area_m2']/1e6:.3f}")
             em4.metric("Max enh. (ppm·m)", f"{chosen['flux']['max_enhancement']:.0f}")
 
-            # ── Small multiples grid ─────────────────────────────────
             st.markdown("##### Plume mask gallery (all observations)")
-            n_cols = 5
+            n_cols = 4
             n_obs = len(evo)
             grid_rows = (n_obs + n_cols - 1) // n_cols
             for gr in range(grid_rows):
@@ -1487,6 +1689,7 @@ if "emit_result" in st.session_state:
                                 r["enhancement"],
                                 mask=r["plume_mask"],
                                 colormap="turbo",
+                                show_outline=True,
                             ),
                             use_container_width=True,
                             output_format="PNG",
