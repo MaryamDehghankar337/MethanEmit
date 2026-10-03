@@ -46,7 +46,7 @@ EMIT_PLM_COLLECTION = "EMITL2BCH4PLM"   # Plume Complexes
 PARAMS = {
     "plume_threshold_ppm_m": 1000.0,
     "min_plume_pixels": 10,
-    "wind_speed_m_s": 2.0,
+    "wind_speed_m_s": 2.0,  # Default fallback value
     "max_plume_area_km2": 100.0,
 }
 
@@ -180,6 +180,65 @@ def geocode_place(query: str):
         return box(lon - d, lat - d, lon + d, lat + d), (lat, lon), label
     except Exception:
         return None, None, None
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  OPEN-METEO WIND
+# ══════════════════════════════════════════════════════════════════════
+
+def get_wind_speed_openmeteo(lat: float, lon: float, dt: datetime) -> Optional[float]:
+    """Fetch 10m wind speed (m/s) from Open-Meteo archive for a given point & time.
+
+    Uses ERA5 reanalysis (free, no API key). Returns the wind speed
+    at the closest hour to ``dt``, or ``None`` on failure.
+    """
+    try:
+        url = "https://archive-api.open-meteo.com/v1/archive"
+        date_str = dt.strftime("%Y-%m-%d")
+        params = {
+            "latitude": round(lat, 4),
+            "longitude": round(lon, 4),
+            "start_date": date_str,
+            "end_date": date_str,
+            "hourly": "wind_speed_10m",
+            "windspeed_unit": "ms",
+            "timezone": "UTC",
+        }
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+
+        hourly = data.get("hourly", {})
+        times = hourly.get("time", [])
+        speeds = hourly.get("wind_speed_10m", [])
+        if not times or not speeds:
+            return None
+
+        # Find the hour closest to dt
+        target = dt.strftime("%Y-%m-%dT%H:00")
+        if target in times:
+            idx = times.index(target)
+        else:
+            # Fallback: nearest by absolute time difference
+            best_idx = 0
+            best_diff = None
+            for i, t in enumerate(times):
+                try:
+                    t_dt = datetime.fromisoformat(t)
+                    diff = abs((t_dt - dt).total_seconds())
+                except Exception:
+                    continue
+                if best_diff is None or diff < best_diff:
+                    best_diff = diff
+                    best_idx = i
+            idx = best_idx
+
+        val = speeds[idx]
+        if val is None:
+            return None
+        return float(val)
+    except Exception:
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -948,7 +1007,7 @@ with settings_col:
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">03 · DETECTION</div>', unsafe_allow_html=True)
 
-    p1, p2, p3 = st.columns(3, gap="small")
+    p1, p2 = st.columns(2, gap="small")
     with p1:
         PARAMS["plume_threshold_ppm_m"] = st.number_input(
             "Enhancement threshold (ppm·m)",
@@ -967,21 +1026,13 @@ with settings_col:
             step=1,
             key="min_plume_pixels",
         )
-    with p3:
-        PARAMS["wind_speed_m_s"] = st.number_input(
-            "Wind speed (m/s)",
-            min_value=0.1,
-            max_value=20.0,
-            value=float(PARAMS["wind_speed_m_s"]),
-            step=0.1,
-            key="wind_speed",
-        )
 
     estimated_area_m2 = int(PARAMS["min_plume_pixels"]) * RESOLUTION * RESOLUTION
     st.markdown(
         f'<div class="card-caption">'
         f'Minimum plume area ≈ {estimated_area_m2:,} m² at {RESOLUTION} m resolution. '
-        f'Wind speed is used for IME flux estimation.</div>',
+        f'Wind speed is fetched automatically from Open-Meteo (ERA5) for each granule. '
+        f'If unavailable, a fallback of {PARAMS["wind_speed_m_s"]:.1f} m/s is used.</div>',
         unsafe_allow_html=True,
     )
     st.markdown('</div>', unsafe_allow_html=True)
@@ -1013,7 +1064,7 @@ with action_col:
                 progress.progress(10, text="Logging in to Earthdata…")
                 login_earthdata()
 
-                progress.progress(35, text="Loading EMIT enhancement…")
+                progress.progress(30, text="Loading EMIT enhancement…")
                 data, transform, crs = load_emit_enhancement(
                     selected_granule, st.session_state.aoi
                 )
@@ -1022,7 +1073,23 @@ with action_col:
                     st.error("EMIT granule did not intersect the AOI.")
                     st.stop()
 
-                progress.progress(65, text="Detecting plumes…")
+                progress.progress(55, text="Fetching wind from Open-Meteo…")
+                _centroid = shape(st.session_state.aoi).centroid
+                _wind = get_wind_speed_openmeteo(
+                    _centroid.y, _centroid.x, dt
+                ) if dt else None
+
+                if _wind is not None:
+                    wind_speed_to_use = _wind
+                    st.info(f"✅ Wind from Open-Meteo (ERA5): {wind_speed_to_use:.2f} m/s")
+                else:
+                    wind_speed_to_use = PARAMS["wind_speed_m_s"]
+                    st.warning(
+                        f"⚠️ Open-Meteo wind unavailable — using fallback: "
+                        f"{wind_speed_to_use:.2f} m/s"
+                    )
+
+                progress.progress(70, text="Detecting plumes…")
                 plume_mask = detect_plume(
                     data,
                     PARAMS["plume_threshold_ppm_m"],
@@ -1031,7 +1098,7 @@ with action_col:
 
                 progress.progress(85, text="Estimating flux…")
                 flux = estimate_flux_ime(
-                    data, plume_mask, PARAMS["wind_speed_m_s"]
+                    data, plume_mask, wind_speed_to_use
                 )
 
                 st.session_state.emit_result = {
@@ -1042,7 +1109,7 @@ with action_col:
                     "crs": crs,
                     "granule_dt": dt,
                     "threshold": PARAMS["plume_threshold_ppm_m"],
-                    "wind_speed": PARAMS["wind_speed_m_s"],
+                    "wind_speed": wind_speed_to_use,
                 }
 
                 progress.progress(100, text="Done")
@@ -1273,6 +1340,8 @@ if "emit_results" in st.session_state and st.session_state.emit_results:
         granules = st.session_state.emit_results[: int(max_granules)]
         progress = st.progress(0, text="Processing granules…")
         batch_results = []
+        _centroid_batch = shape(st.session_state.aoi).centroid
+
         for i, g in enumerate(granules):
             progress.progress(
                 int(100 * (i + 1) / len(granules)),
@@ -1284,19 +1353,28 @@ if "emit_results" in st.session_state and st.session_state.emit_results:
                     continue
                 if valid_coverage(data) < 0.02:
                     continue
+
+                g_dt = granule_datetime(g)
+                wind = get_wind_speed_openmeteo(
+                    _centroid_batch.y, _centroid_batch.x, g_dt
+                ) if g_dt else None
+                if wind is None:
+                    wind = PARAMS["wind_speed_m_s"]
+
                 pm = detect_plume(
                     data,
                     PARAMS["plume_threshold_ppm_m"],
                     int(PARAMS["min_plume_pixels"]),
                 )
-                f = estimate_flux_ime(data, pm, PARAMS["wind_speed_m_s"])
+                f = estimate_flux_ime(data, pm, wind)
                 batch_results.append({
-                    "date": granule_datetime(g),
+                    "date": g_dt,
                     "enhancement": data,
                     "plume_mask": pm,
                     "flux": f,
                     "transform": tform,
                     "crs": tcrs,
+                    "wind_speed": wind,
                 })
             except Exception:
                 continue
@@ -1513,6 +1591,8 @@ if "emit_result" in st.session_state:
                     )
                 else:
                     evo_results = []
+                    _centroid_evo = shape(st.session_state.aoi).centroid
+
                     for i, g in enumerate(evo_granules):
                         progress.progress(
                             int(100 * (i + 1) / len(evo_granules)),
@@ -1529,13 +1609,20 @@ if "emit_result" in st.session_state:
                             if cov < 0.02:
                                 continue
 
+                            g_dt = granule_datetime(g)
+                            wind = get_wind_speed_openmeteo(
+                                _centroid_evo.y, _centroid_evo.x, g_dt
+                            ) if g_dt else None
+                            if wind is None:
+                                wind = PARAMS["wind_speed_m_s"]
+
                             pm = detect_plume(
                                 data,
                                 PARAMS["plume_threshold_ppm_m"],
                                 int(PARAMS["min_plume_pixels"]),
                             )
                             f = estimate_flux_ime(
-                                data, pm, PARAMS["wind_speed_m_s"]
+                                data, pm, wind
                             )
 
                             centroid_px = None
@@ -1555,7 +1642,7 @@ if "emit_result" in st.session_state:
                                     pass
 
                             evo_results.append({
-                                "date": granule_datetime(g),
+                                "date": g_dt,
                                 "enhancement": data,
                                 "plume_mask": pm,
                                 "flux": f,
@@ -1564,6 +1651,7 @@ if "emit_result" in st.session_state:
                                 "centroid_px": centroid_px,
                                 "centroid_geo": centroid_geo,
                                 "coverage": cov,
+                                "wind_speed": wind,
                             })
                         except Exception:
                             continue
@@ -1603,12 +1691,16 @@ if "emit_result" in st.session_state:
                     "date": r["date"].strftime("%Y-%m-%d") if r["date"] else "-",
                     "coverage": lbl,
                     "flux_kg_h": r["flux"]["Q_kg_h"],
+                    "wind_m_s": r.get("wind_speed", None),
                 })
             st.markdown("##### Data coverage per observation")
             st.dataframe(
                 pd.DataFrame(cov_rows),
                 use_container_width=True,
                 hide_index=True,
+                column_config={
+                    "wind_m_s": st.column_config.NumberColumn("Wind (m/s)", format="%.2f"),
+                },
             )
 
             rows = []
@@ -1621,6 +1713,7 @@ if "emit_result" in st.session_state:
                     "max_enh_ppmm": r["flux"]["max_enhancement"],
                     "mean_enh_ppmm": r["flux"]["mean_enhancement"],
                     "has_plume": int(r["flux"]["n_pixels"] > 0),
+                    "wind_m_s": r.get("wind_speed", None),
                 })
             evo_df = pd.DataFrame(rows)
             if not evo_df.empty and evo_df["date"].notna().any():
@@ -1643,6 +1736,7 @@ if "emit_result" in st.session_state:
                         "max_enh_ppmm": st.column_config.NumberColumn("Max enh.", format="%.0f"),
                         "mean_enh_ppmm": st.column_config.NumberColumn("Mean enh.", format="%.0f"),
                         "has_plume": st.column_config.NumberColumn("Plume?", format="%d"),
+                        "wind_m_s": st.column_config.NumberColumn("Wind (m/s)", format="%.2f"),
                     },
                 )
 
